@@ -129,16 +129,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             rootView: MenuView().environment(appState)
         )
 
-        // Deterministic sizing: propose the fixed panel width and take the
-        // height SwiftUI actually needs via sizeThatFits. Ideal-size
-        // discovery (preferredContentSize/fittingSize) is unreliable here:
-        // it collapsed the panel to a zero-width sliver.
-        var panelSize = hostingView.sizeThatFits(
-            NSSize(width: 320, height: .greatestFiniteMagnitude)
-        )
-        panelSize.width = 320
-        if panelSize.height < 100 || panelSize.height.isInfinite { panelSize.height = 300 }
-        hostingView.frame = NSRect(origin: .zero, size: panelSize)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 300)
 
         menuItem.view = hostingView
         menu.addItem(menuItem)
