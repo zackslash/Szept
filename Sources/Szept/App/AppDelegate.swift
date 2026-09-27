@@ -129,7 +129,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             rootView: MenuView().environment(appState)
         )
 
-        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 300)
+        // Size the panel to the SwiftUI content (MenuView fixes the width
+        // at 320) instead of a hardcoded height that leaves dead space.
+        hostingView.sizingOptions = [.preferredContentSize]
 
         menuItem.view = hostingView
         menu.addItem(menuItem)
