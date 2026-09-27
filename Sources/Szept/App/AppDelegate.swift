@@ -130,8 +130,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         // Size the panel to the SwiftUI content (MenuView fixes the width
-        // at 320) instead of a hardcoded height that leaves dead space.
+        // at 320). fittingSize forces a layout pass; without an explicit
+        // frame the menu item renders at zero height and nothing appears.
         hostingView.sizingOptions = [.preferredContentSize]
+        var panelSize = hostingView.fittingSize
+        if panelSize.height < 100 { panelSize.height = 300 }
+        hostingView.frame = NSRect(origin: .zero, size: panelSize)
 
         menuItem.view = hostingView
         menu.addItem(menuItem)
