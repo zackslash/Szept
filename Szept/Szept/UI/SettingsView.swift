@@ -52,15 +52,37 @@ private struct GeneralTab: View {
 }
 
 private struct AudioTab: View {
-    @AppStorage("makeupGainDB") private var makeupGainDB: Double = 6.0
-    @AppStorage("autoAdjust") private var autoAdjust: Bool = true
-    @AppStorage("qualityPreset") private var qualityPreset: String = "balanced"
+    @AppStorage("autoAdjust") private var autoAdjust: Bool = false
+    @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
+    @AppStorage("inputDeviceUID") private var inputDeviceUID: String = ""
+    @AppStorage("outputDeviceUID") private var outputDeviceUID: String = ""
+
+    @State private var inputDevices: [AudioDeviceInfo] = []
+    @State private var outputDevices: [AudioDeviceInfo] = []
+
+    private var blackHoleDetected: Bool {
+        outputDevices.contains { $0.name.localizedCaseInsensitiveContains("BlackHole") }
+    }
 
     var body: some View {
         Form {
-            Section("Voice Boost") {
-                LabeledContent("Gain: +\(Int(makeupGainDB)) dB") {
-                    Slider(value: $makeupGainDB, in: 0...18, step: 1)
+            Section("Devices") {
+                Picker("Microphone", selection: $inputDeviceUID) {
+                    Text("System default").tag("")
+                    ForEach(inputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                }
+                Picker("Output device", selection: $outputDeviceUID) {
+                    Text("Auto (BlackHole)").tag("")
+                    ForEach(outputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                }
+                if !blackHoleDetected {
+                    Text("BlackHole not detected. Install it from existential.audio or pick another loopback device.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
             Section("Isolation") {
@@ -77,6 +99,12 @@ private struct AudioTab: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { reloadDevices() }
+    }
+
+    private func reloadDevices() {
+        inputDevices = (try? AudioDeviceManager.inputDevices()) ?? []
+        outputDevices = (try? AudioDeviceManager.outputDevices()) ?? []
     }
 }
 

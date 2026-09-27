@@ -25,6 +25,10 @@ final class MicProcessor {
     nonisolated(unsafe) private var tapAutoAdjust: Bool = true
     nonisolated(unsafe) private var tapIsolation: Float = 50
 
+    // MARK: - Device routing (set before start())
+    var inputDeviceID: AudioDeviceID?
+    var outputDeviceID: AudioDeviceID?
+
     // MARK: - AVAudioEngine
     private var engine = AVAudioEngine()
     private var isolationUnit: AVAudioUnitEffect?
@@ -51,6 +55,28 @@ final class MicProcessor {
         engine = AVAudioEngine()
         isolationUnit = nil
 
+        do {
+            // Safety net for callers that don't resolve devices first
+            // (e.g. the menu bar toggle): never render to the system default
+            // output, which would blast the processed mic from the speakers.
+            if outputDeviceID == nil {
+                outputDeviceID = try AudioDeviceManager.firstBlackHole()?.id
+                if outputDeviceID == nil {
+                    throw NSError(domain: "MicProcessor", code: 11,
+                                  userInfo: [NSLocalizedDescriptionKey: "No output device found. Install BlackHole (existential.audio/blackhole) or pick a device in Settings."])
+                }
+            }
+            if let id = inputDeviceID {
+                try setDevice(id, on: engine.inputNode)
+            }
+            if let id = outputDeviceID {
+                try setDevice(id, on: engine.outputNode)
+            }
+        } catch {
+            isolationUnit = nil
+            throw error
+        }
+
         let unit = AVAudioUnitEffect(audioComponentDescription: Self.isolationDescription)
         isolationUnit = unit
 
@@ -68,6 +94,7 @@ final class MicProcessor {
         let mixerNode = engine.mainMixerNode
         engine.connect(engine.inputNode, to: unit, format: inputFormat)
         engine.connect(unit, to: mixerNode, format: inputFormat)
+        engine.connect(mixerNode, to: engine.outputNode, format: nil)
 
         setIsolationParameter(tapIsolation)
         
@@ -121,7 +148,7 @@ final class MicProcessor {
         let initialIsolation: Float
         switch preset {
         case "light":      initialIsolation = 30
-        case "aggressive": initialIsolation = 70
+        case "aggressive": initialIsolation = 80
         default:           initialIsolation = 50
         }
         setIsolationLevel(initialIsolation)
@@ -139,6 +166,17 @@ final class MicProcessor {
     private func setIsolationParameter(_ value: Float) {
         guard let au = isolationUnit?.audioUnit else { return }
         AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, value, 0)
+    }
+
+    private func setDevice(_ deviceID: AudioDeviceID, on node: AVAudioIONode) throws {
+        var id = deviceID
+        let status = AudioUnitSetProperty(node.audioUnit, kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global, 0, &id,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard status == noErr else {
+            throw NSError(domain: "MicProcessor", code: 10,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to select audio device (code \(status))"])
+        }
     }
 
     // MARK: - Tap installation
@@ -171,8 +209,6 @@ final class MicProcessor {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
 
-        DSP.applyMakeupGain(samples: channelData, count: frameCount, gainLinear: tapGainLinear)
-        DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 0.7)
         let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
 
         if tapAutoAdjust {
