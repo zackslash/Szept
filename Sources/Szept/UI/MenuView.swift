@@ -53,8 +53,8 @@ struct MenuView: View {
 
     private var footerSection: some View {
         HStack {
-            Button("Open Mic Settings") {
-                appState.micModeMonitor.openMicModePicker()
+            SettingsLink {
+                Text("Settings…")
             }
             .buttonStyle(.borderless)
             Spacer()
