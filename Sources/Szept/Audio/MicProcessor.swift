@@ -21,6 +21,10 @@ final class MicProcessor {
     nonisolated(unsafe) private var tapAutoAdjust: Bool = false
     nonisolated(unsafe) private var tapIsolation: Float = 50
 
+    // MARK: - Clarity ("Broadcast Voice")
+
+    private let voiceChain = VoiceChain()
+
     // MARK: - Device routing (set before start())
 
     var inputDeviceID: AudioDeviceID?
@@ -119,6 +123,10 @@ final class MicProcessor {
 
         setIsolationParameter(tapIsolation)
 
+        // Arm the clarity chain with the render rate; the level itself is
+        // picked up by the render thread at the first buffer.
+        voiceChain.configure(sampleRate: Float(inputFormat.sampleRate))
+
         // Reset the ring before the engine starts so the tap (producer)
         // never races the reset. Allocated once, reused forever.
         if ring == nil {
@@ -206,6 +214,10 @@ final class MicProcessor {
         currentIsolation = clamped
     }
 
+    func setClarity(_ level: ClarityLevel) {
+        voiceChain.setClarity(level)
+    }
+
     private func setIsolationParameter(_ value: Float) {
         guard let au = isolationUnit?.audioUnit else { return }
         AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, value, 0)
@@ -246,6 +258,10 @@ final class MicProcessor {
         guard let channelData = buffer.floatChannelData?[0] else { return }
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
+
+        // Clarity lift runs on the processed signal before it reaches the
+        // ring (and therefore BlackHole); metering reads the post-chain audio.
+        voiceChain.process(channelData, count: frameCount)
 
         pushToRing(samples: channelData, count: frameCount)
 

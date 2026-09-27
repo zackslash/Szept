@@ -1,5 +1,6 @@
 import SwiftUI
 import ServiceManagement
+import Carbon.HIToolbox
 
 struct SettingsView: View {
     var body: some View {
@@ -31,11 +32,48 @@ private struct GeneralTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("Hotkeys") {
+                ForEach(AppAction.allCases, id: \.self) { action in
+                    LabeledContent(hotkeyLabel(for: action)) {
+                        Text(hotkeyCombo(for: action))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("Global hotkeys work system-wide. Combos already claimed by another app are silently skipped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
+    }
+
+    private func hotkeyLabel(for action: AppAction) -> String {
+        switch action {
+        case .toggleEngine:  return "Start/stop processing"
+        case .cycleClarity:  return "Cycle clarity"
+        case .strengthUp:    return "Isolation strength up"
+        case .strengthDown:  return "Isolation strength down"
+        }
+    }
+
+    /// Read-only display of the current binding. Carbon modifier bits are
+    /// rendered as glyphs; unknown key codes fall back to their number.
+    private func hotkeyCombo(for action: AppAction) -> String {
+        let defaults = UserDefaults.standard
+        let key = HotkeyManager.prefKey(for: action)
+        let binding = defaults.string(forKey: key).flatMap(HotkeyManager.decode)
+            ?? HotkeyManager.defaultBinding(for: action)
+
+        var glyphs = ""
+        if binding.modifierMask & UInt32(controlKey) != 0 { glyphs += "\u{2303}" }  // ^
+        if binding.modifierMask & UInt32(optionKey) != 0 { glyphs += "\u{2325}" }   // ⌥
+        if binding.modifierMask & UInt32(shiftKey) != 0 { glyphs += "\u{21E7}" }    // ⇧
+        if binding.modifierMask & UInt32(cmdKey) != 0 { glyphs += "\u{2318}" }      // ⌘
+        return glyphs + HotkeyManager.keyName(keyCode: binding.keyCode)
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
@@ -52,10 +90,12 @@ private struct GeneralTab: View {
 }
 
 private struct AudioTab: View {
+    @Environment(AppState.self) private var appState
     @AppStorage("autoAdjust") private var autoAdjust: Bool = false
     @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
     @AppStorage("inputDeviceUID") private var inputDeviceUID: String = ""
     @AppStorage("outputDeviceUID") private var outputDeviceUID: String = ""
+    @AppStorage("clarityLevel") private var clarityLevel: String = "off"
 
     @State private var inputDevices: [AudioDeviceInfo] = []
     @State private var outputDevices: [AudioDeviceInfo] = []
@@ -84,6 +124,24 @@ private struct AudioTab: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+            }
+            Section("Clarity") {
+                LabeledContent("Broadcast voice") {
+                    Picker("Broadcast voice", selection: $clarityLevel) {
+                        ForEach(ClarityLevel.allCases, id: \.self) { level in
+                            Text(level.label).tag(level.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                .onChange(of: clarityLevel) { _, raw in
+                    appState.micProcessor.setClarity(ClarityLevel(rawValue: raw) ?? .off)
+                }
+                Text("Adds a gentle presence lift with a matching de-esser for a clearer, more broadcast-like voice.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Isolation") {
                 LabeledContent("Strength") {

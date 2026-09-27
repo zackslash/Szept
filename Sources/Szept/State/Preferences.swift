@@ -9,4 +9,5 @@ final class Preferences {
     @AppStorage("qualityPreset") var qualityPreset: String = "aggressive"
     @AppStorage("inputDeviceUID") var inputDeviceUID: String = ""
     @AppStorage("outputDeviceUID") var outputDeviceUID: String = ""
+    @AppStorage("clarityLevel") var clarityLevel: String = "off"
 }

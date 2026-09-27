@@ -22,6 +22,17 @@
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>dev.zackslash.Szept.url</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>szept</string>
+            </array>
+        </dict>
+    </array>
     <key>NSMicrophoneUsageDescription</key>
     <string>Szept processes your microphone audio on this Mac to remove background noise. Audio never leaves the machine.</string>
 </dict>

@@ -6,14 +6,43 @@ import AVFoundation
 class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
     private var statusItem: NSStatusItem!
+    private var hotkeyManager: HotkeyManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FileLog.log("app: didFinishLaunching")
         registerDefaults()
         loadPreferencesIntoProcessor()
         setupStatusItem()
+        setupHotkeys()
         observeMode()
         checkMicPermission()
+    }
+
+    /// `szept://` opens are handled here instead of `.onOpenURL`: SwiftUI's
+    /// `onOpenURL` is a View modifier and does not reach a menu-bar app whose
+    /// content view is not instantiated yet, while the app delegate receives
+    /// open events from launch.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            guard let action = AppAction.from(url: url) else {
+                FileLog.log("url: unrecognized \(url.absoluteString)")
+                continue
+            }
+            FileLog.log("url: \(action) via \(url.absoluteString)")
+            DispatchQueue.main.async { [appState] in
+                action.perform(on: appState)
+            }
+        }
+    }
+
+    // MARK: - Hotkeys
+
+    private func setupHotkeys() {
+        hotkeyManager = HotkeyManager { [weak self] action in
+            FileLog.log("hotkey: \(action)")
+            guard let self else { return }
+            action.perform(on: self.appState)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -28,7 +57,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "autoAdjust": false,
             "launchAtLogin": false,
             "isProcessingEnabled": true,
-            "qualityPreset": "aggressive"
+            "qualityPreset": "aggressive",
+            "clarityLevel": "off"
         ])
     }
 
@@ -38,6 +68,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // silently re-enable the controller.
         UserDefaults.standard.set(false, forKey: "autoAdjust")
         appState.micProcessor.loadPreferences(autoAdjust: false)
+        let clarityRaw = UserDefaults.standard.string(forKey: "clarityLevel") ?? "off"
+        appState.micProcessor.setClarity(ClarityLevel(rawValue: clarityRaw) ?? .off)
     }
 
     // MARK: - Permission + Auto-start
