@@ -5,11 +5,16 @@ cd "$(dirname "$0")/.."
 
 APP="build/Szept.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swift build -c release
 cp .build/release/Szept "$APP/Contents/MacOS/Szept"
 cp packaging/Info.plist "$APP/Contents/Info.plist"
+if [ -f packaging/AppIcon.icns ]; then
+    cp packaging/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+else
+    echo "note: packaging/AppIcon.icns missing, run scripts/make-icon.sh on macOS"
+fi
 
 codesign --force --sign - "$APP"
 echo "Built $APP"
