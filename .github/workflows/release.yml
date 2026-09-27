@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Szept.app
+        run: bash scripts/package.sh
+
+      - name: Zip bundle
+        run: |
+          cd build
+          ditto -c -k --keepParent Szept.app "Szept-${GITHUB_REF_NAME}.zip"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Szept-${{ github.ref_name }}.zip
+          generate_release_notes: true

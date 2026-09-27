@@ -24,6 +24,14 @@ With Homebrew:
 Reboot after installing, or run sudo killall coreaudiod. Without Homebrew,
 download the pkg from https://existential.audio, install it, then reboot.
 
+## Install from a release
+
+Download the zip from Releases, unzip it, and move Szept.app to
+/Applications. The build is ad hoc signed (no Developer ID), so macOS
+blocks it on first launch: open System Settings, go to Privacy and
+Security, and click Open Anyway. Then approve the microphone prompt and
+pick your interface as the input device in Settings.
+
 ## Build and run
 
 Release build from the command line:
