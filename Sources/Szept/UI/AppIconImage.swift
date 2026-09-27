@@ -4,17 +4,17 @@ import SwiftUI
 /// the custom About panel. SwiftUI `Image` cannot read `.icns` assets by
 /// name, and `NSApplication.icon` may not be set yet when a window opens.
 struct AppIconImage: View {
-    var body: some View {
-        Image(nsImage: Self.loadAppIcon())
-            .resizable()
-    }
-
-    private static func loadAppIcon() -> NSImage {
+    private static let icon: NSImage = {
         if let path = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
            let icon = NSImage(contentsOfFile: path) {
             return icon
         }
         return NSImage(size: NSSize(width: 48, height: 48))
+    }()
+
+    var body: some View {
+        Image(nsImage: Self.icon)
+            .resizable()
     }
 }
 

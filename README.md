@@ -52,8 +52,8 @@ Grant microphone access when prompted.
 2. In your call app, set the microphone to BlackHole 2ch.
 3. Turn off noise suppression in the call app. Two suppression layers
    stacked sound bad.
-4. Auto adjust is off by default. Loud noise such as barking pushes
-   isolation to maximum and parks it there. Use a fixed preset.
+4. Strength is a fixed choice: Gentle, Medium, or Max. There is no auto
+   mode.
 5. There is no software gain stage. Set levels on your interface or mixer.
 
 ## Known issues

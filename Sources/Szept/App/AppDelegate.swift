@@ -53,6 +53,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             panel.title = "About Szept"
             panel.isFloatingPanel = true
             panel.hidesOnDeactivate = false
+            // Programmatic panels release themselves on close by default,
+            // which would dangle our strong reference on the second open.
+            panel.isReleasedWhenClosed = false
             aboutPanel = panel
         }
         aboutPanel?.center()
