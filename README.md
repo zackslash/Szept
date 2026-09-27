@@ -12,8 +12,17 @@ Input device -> AUSoundIsolation -> BlackHole -> call app
 ## Requirements
 
 - macOS 14 or newer, Apple Silicon
-- BlackHole, installed separately from https://existential.audio
+- BlackHole 2ch, installed separately (GPL-3, not bundled)
 - Swift 6 toolchain to build: Xcode 16 or newer, or Command Line Tools
+
+## Installing BlackHole
+
+With Homebrew:
+
+    brew install --cask blackhole-2ch
+
+Reboot after installing, or run sudo killall coreaudiod. Without Homebrew,
+download the pkg from https://existential.audio, install it, then reboot.
 
 ## Build and run
 
