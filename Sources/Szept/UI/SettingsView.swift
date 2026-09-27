@@ -42,24 +42,6 @@ private struct AboutCard: View {
     }
 }
 
-/// Loads the bundled `AppIcon.icns` directly; SwiftUI `Image` cannot read
-/// `.icns` assets by name, and `NSApplication.icon` may not be set yet when
-/// the Settings window opens.
-private struct AppIconImage: View {
-    var body: some View {
-        Image(nsImage: Self.loadAppIcon())
-            .resizable()
-    }
-
-    private static func loadAppIcon() -> NSImage {
-        if let path = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
-           let icon = NSImage(contentsOfFile: path) {
-            return icon
-        }
-        return NSImage(size: NSSize(width: 48, height: 48))
-    }
-}
-
 private struct GeneralTab: View {
     @AppStorage("launchAtLogin") private var launchAtLogin: Bool = false
 

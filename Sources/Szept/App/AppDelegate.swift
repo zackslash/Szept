@@ -14,12 +14,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
            let icon = NSImage(contentsOfFile: iconPath) {
             NSApp.applicationIconImage = icon
         }
+        // The app menu only exists once a real window (Settings) takes focus,
+        // so retarget its About item lazily whenever the app becomes active.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
         registerDefaults()
         loadPreferencesIntoProcessor()
         setupStatusItem()
         setupHotkeys()
         observeMode()
         checkMicPermission()
+    }
+
+    /// Replace the standard About panel with our own so the icon always
+    /// resolves from the bundle (the standard panel loses it for this
+    /// ad hoc signed bundle).
+    @objc private func appDidBecomeActive() {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else { return }
+        for item in appMenu.items
+        where item.action == #selector(NSApplication.orderStandardAboutPanel(_:)) {
+            item.target = self
+            item.action = #selector(showAboutPanel)
+        }
+    }
+
+    private var aboutPanel: NSPanel?
+
+    @objc private func showAboutPanel() {
+        if aboutPanel == nil {
+            let panel = NSPanel(
+                contentViewController: NSHostingController(rootView: AboutPanelContent())
+            )
+            panel.styleMask = [.titled, .closable]
+            panel.title = "About Szept"
+            panel.isFloatingPanel = true
+            panel.hidesOnDeactivate = false
+            aboutPanel = panel
+        }
+        aboutPanel?.center()
+        aboutPanel?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     /// `szept://` opens are handled here instead of `.onOpenURL`: SwiftUI's
