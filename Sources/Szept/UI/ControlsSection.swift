@@ -31,6 +31,7 @@ struct ControlsSection: View {
                 Text("Max").tag("aggressive")
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .disabled(!processor.isRunning)
             .onChange(of: qualityPreset) { _, newValue in
                 processor.applyQualityPreset(newValue)

@@ -94,6 +94,7 @@ private struct AudioTab: View {
                         Text("Max").tag("aggressive")
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
                     .fixedSize()
                 }
             }
