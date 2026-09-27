@@ -86,12 +86,12 @@ private struct AudioTab: View {
                 }
             }
             Section("Isolation") {
-                Toggle("Auto-adjust isolation level", isOn: $autoAdjust)
-                LabeledContent("Quality preset") {
-                    Picker("Quality preset", selection: $qualityPreset) {
-                        Text("Light").tag("light")
-                        Text("Balanced").tag("balanced")
-                        Text("Aggressive").tag("aggressive")
+                Toggle("Auto-adjust strength", isOn: $autoAdjust)
+                LabeledContent("Strength") {
+                    Picker("Strength", selection: $qualityPreset) {
+                        Text("Gentle").tag("light")
+                        Text("Medium").tag("balanced")
+                        Text("Max").tag("aggressive")
                     }
                     .pickerStyle(.segmented)
                     .fixedSize()
