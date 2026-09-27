@@ -36,7 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func appDidBecomeActive() {
         guard let appMenu = NSApp.mainMenu?.items.first?.submenu else { return }
         for item in appMenu.items
-        where item.action == #selector(NSApplication.orderStandardAboutPanel(_:)) {
+        where item.action == Selector("orderStandardAboutPanel:") {
             item.target = self
             item.action = #selector(showAboutPanel)
         }
