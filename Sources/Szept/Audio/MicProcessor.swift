@@ -360,7 +360,7 @@ final class MicProcessor {
         }
 
         let callback = AURenderCallbackStruct(
-            inputProc: { (inRefCon, _, _, inNumberFrames, ioData) in
+            inputProc: { (inRefCon, _, _, _, inNumberFrames, ioData) in
                 let processor = Unmanaged<MicProcessor>.fromOpaque(inRefCon).takeUnretainedValue()
                 processor.drainRing(into: ioData, frames: Int(inNumberFrames))
                 return noErr
@@ -385,7 +385,7 @@ final class MicProcessor {
                           userInfo: [NSLocalizedDescriptionKey: "Could not initialize output unit (code \(status))"])
         }
 
-        status = AudioUnitStart(au)
+        status = AudioOutputUnitStart(au)
         guard status == noErr else {
             FileLog.log("output: start failed (\(status))")
             AudioUnitUninitialize(au)
