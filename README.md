@@ -63,6 +63,16 @@ Grant microphone access when prompted.
   unprocessed.
 - The input device and BlackHole run on unsynchronised clocks, so very long
   sessions can drift.
+- The Control Center mic indicator and the Privacy and Security microphone
+  list show a blank icon for Szept on macOS 26. Attribution itself works:
+  the app is listed and the permission functions. Finder, the Dock, the app
+  switcher and the About panel all show the icon. Tested without effect:
+  icns only, a compiled asset catalog with and without a flat AppIcon
+  stack, a resource fork custom icon, an unsigned build, and a verified
+  bundle and registration. Menu bar only apps from other developers show
+  their icons in the same lists, and signed apps such as Chrome have
+  reported generic icons in privacy lists too, so this looks like a Tahoe
+  icon pipeline quirk rather than a problem in this bundle.
 - FaceTime blocks BlackHole.
 
 ## Credits
