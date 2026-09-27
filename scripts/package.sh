@@ -22,14 +22,14 @@ ACTOOL="$(xcrun --find actool 2>/dev/null || true)"
 if [ -n "$ACTOOL" ]; then
     rm -rf build/actool && mkdir -p build/actool
     if "$ACTOOL" --compile build/actool --platform macosx \
-        --minimum-deployment-target 14.0 --app-icon AppIcon \
+        --minimum-deployment-target 14.0 --target-device mac --app-icon AppIcon \
         --output-partial-info-plist build/icon-partial.plist \
         Sources/Szept/Assets.xcassets >/dev/null 2>&1 \
         && [ -f build/actool/Assets.car ]; then
         cp build/actool/Assets.car "$APP/Contents/Resources/Assets.car"
         echo "icon: compiled Assets.car"
     else
-        echo "note: actool compile failed, icon may not show in some surfaces"
+        echo "icon: actool compile failed, some surfaces may show no icon"
     fi
 else
     echo "note: actool not found (needs Xcode or CLT), skipping Assets.car"
