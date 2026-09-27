@@ -359,7 +359,7 @@ final class MicProcessor {
                           userInfo: [NSLocalizedDescriptionKey: "Output unit rejected stream format (code \(status))"])
         }
 
-        let callback = AURenderCallbackStruct(
+        var callback = AURenderCallbackStruct(
             inputProc: { (inRefCon, _, _, _, inNumberFrames, ioData) in
                 let processor = Unmanaged<MicProcessor>.fromOpaque(inRefCon).takeUnretainedValue()
                 processor.drainRing(into: ioData, frames: Int(inNumberFrames))
