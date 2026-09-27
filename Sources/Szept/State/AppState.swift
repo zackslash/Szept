@@ -27,8 +27,8 @@ final class AppState {
 
     var statusDescription: String {
         switch currentMode {
-        case .enhanced:   return "Szept active. System Voice Isolation is also on."
-        case .standalone: return "Szept processing active"
+        case .enhanced:   return "Szept active with system Voice Isolation. Strongest noise reduction."
+        case .standalone: return "Szept active. Turn on Voice Isolation in Control Center for stronger noise reduction."
         case .off:        return "Processing off"
         }
     }

@@ -111,6 +111,16 @@ final class MicProcessor {
             throw error
         }
 
+        // AVAudioEngine can silently reset the output unit's device while
+        // assembling the graph. Verify it actually took; re-apply once; and
+        // refuse to run if it will not stick, so processed mic audio can
+        // never end up on the system speakers.
+        if !verifyOrReapplyOutputDevice() {
+            stop()
+            throw NSError(domain: "MicProcessor", code: 13,
+                          userInfo: [NSLocalizedDescriptionKey: "Output device did not stick (audio would play from speakers). Stopped for safety."])
+        }
+
         isRunning = true
         logger.info("MicProcessor started with format: \(inputFormat)")
     }
@@ -181,6 +191,47 @@ final class MicProcessor {
             throw NSError(domain: "MicProcessor", code: 10,
                           userInfo: [NSLocalizedDescriptionKey: "Failed to select audio device (code \(status))"])
         }
+    }
+
+    /// Reads back the output unit's device after engine start. AVAudioEngine
+    /// can silently reset it while assembling the graph; if it drifted, the
+    /// property is re-applied once and re-read. Returns false when the
+    /// output device cannot be made to stick.
+    private func verifyOrReapplyOutputDevice() -> Bool {
+        guard let expected = outputDeviceID else { return true }
+        guard let au = engine.outputNode.audioUnit else {
+            logger.error("Output verify: no audio unit on output node")
+            return false
+        }
+
+        func currentDevice() -> AudioDeviceID? {
+            var id = AudioDeviceID(0)
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            let status = AudioUnitGetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                              kAudioUnitScope_Global, 0, &id, &size)
+            return status == noErr ? id : nil
+        }
+
+        guard let first = currentDevice() else {
+            logger.error("Output verify: read-back failed")
+            return false
+        }
+        if first == expected {
+            logger.notice("Output device OK after start: \(first, privacy: .public)")
+            return true
+        }
+
+        logger.error("Output device drifted to \(first, privacy: .public), expected \(expected, privacy: .public); re-applying")
+        var id = expected
+        let setResult = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                             kAudioUnitScope_Global, 0, &id,
+                                             UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard setResult == noErr, let second = currentDevice(), second == expected else {
+            logger.error("Output device re-apply failed (set result \(setResult))")
+            return false
+        }
+        logger.notice("Output device corrected to \(second, privacy: .public) after re-apply")
+        return true
     }
 
     // MARK: - Tap installation

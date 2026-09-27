@@ -33,8 +33,8 @@ struct StatusCard: View {
 
     private var dotColor: Color {
         switch mode {
-        case .enhanced:   return .blue
-        case .standalone: return .green
+        case .enhanced:   return .green
+        case .standalone: return .blue
         case .off:        return Color(.systemGray)
         }
     }
