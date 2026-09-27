@@ -8,6 +8,12 @@ enum AppAction: CaseIterable {
     case cycleClarity
     case strengthUp
     case strengthDown
+    case muteOn
+    case muteOff
+    case muteToggle
+    case bypassOn
+    case bypassOff
+    case bypassToggle
 
     /// Parse a `szept://` URL into an action. In custom-scheme URLs the verb
     /// is the host; an optional sub-verb is the first path component, e.g.
@@ -18,11 +24,17 @@ enum AppAction: CaseIterable {
         let host = url.host?.lowercased() ?? ""
         let sub = url.pathComponents.dropFirst().first?.lowercased() ?? ""
         switch (host, sub) {
-        case ("toggle", _):      return .toggleEngine
-        case ("clarity", _):     return .cycleClarity
+        case ("toggle", _):        return .toggleEngine
+        case ("clarity", _):       return .cycleClarity
         case ("strength", "down"): return .strengthDown
-        case ("strength", _):    return .strengthUp
-        default:                 return nil
+        case ("strength", _):      return .strengthUp
+        case ("mute", "on"):       return .muteOn
+        case ("mute", "off"):      return .muteOff
+        case ("mute", _):          return .muteToggle
+        case ("bypass", "on"):     return .bypassOn
+        case ("bypass", "off"):    return .bypassOff
+        case ("bypass", _):        return .bypassToggle
+        default:                   return nil
         }
     }
 
@@ -37,6 +49,18 @@ enum AppAction: CaseIterable {
             shiftStrength(on: appState, up: true)
         case .strengthDown:
             shiftStrength(on: appState, up: false)
+        case .muteOn:
+            appState.micProcessor.setMuted(true)
+        case .muteOff:
+            appState.micProcessor.setMuted(false)
+        case .muteToggle:
+            appState.micProcessor.setMuted(!appState.micProcessor.isMuted)
+        case .bypassOn:
+            appState.micProcessor.setBypassed(true)
+        case .bypassOff:
+            appState.micProcessor.setBypassed(false)
+        case .bypassToggle:
+            appState.micProcessor.setBypassed(!appState.micProcessor.isBypassed)
         }
     }
 

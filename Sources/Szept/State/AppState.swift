@@ -26,6 +26,9 @@ final class AppState {
     }
 
     var statusDescription: String {
+        guard micProcessor.isRunning else { return "Processing off" }
+        if micProcessor.isMuted { return "Muted. Mic still monitored." }
+        if micProcessor.isBypassed { return "Bypass A/B active." }
         switch currentMode {
         case .enhanced:   return "Szept active with system Voice Isolation. Strongest noise reduction."
         case .standalone: return "Szept active. Turn on Voice Isolation in Control Center for stronger noise reduction."

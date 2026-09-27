@@ -23,7 +23,8 @@ struct MenuView: View {
             } else {
                 StatusCard(
                     mode: appState.currentMode,
-                    description: appState.statusDescription
+                    description: appState.statusDescription,
+                    isMuted: appState.micProcessor.isMuted
                 )
             }
             if let errorMessage = appState.lastError {
@@ -62,6 +63,16 @@ struct MenuView: View {
             }
             .buttonStyle(.borderless)
             Spacer()
+            Button(appState.micProcessor.isMuted ? "Unmute" : "Mute") {
+                appState.micProcessor.setMuted(!appState.micProcessor.isMuted)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!appState.micProcessor.isRunning)
+            Button(appState.micProcessor.isBypassed ? "A/B" : "Bypass") {
+                appState.micProcessor.setBypassed(!appState.micProcessor.isBypassed)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!appState.micProcessor.isRunning)
             Button(appState.micProcessor.isRunning ? "Stop" : "Start") {
                 toggleEngine()
             }

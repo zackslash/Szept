@@ -11,6 +11,8 @@ final class MicProcessor {
     var isRunning: Bool = false
     var outputLevel: Float = 0
     var currentIsolation: Float = 50
+    private(set) var isMuted: Bool = false
+    private(set) var isBypassed: Bool = false
 
     var autoAdjust: Bool = false {
         didSet { tapAutoAdjust = autoAdjust }
@@ -20,6 +22,7 @@ final class MicProcessor {
 
     nonisolated(unsafe) private var tapAutoAdjust: Bool = false
     nonisolated(unsafe) private var tapIsolation: Float = 50
+    nonisolated(unsafe) private var tapMuted: Bool = false
 
     // MARK: - Clarity ("Broadcast Voice")
 
@@ -70,6 +73,11 @@ final class MicProcessor {
         guard !isRunning else { return }
 
         FileLog.log("start: beginning")
+
+        // Mute and bypass never survive a restart: always start unmuted and
+        // un-bypassed (this also restores any pre-bypass isolation/clarity).
+        if isMuted { setMuted(false) }
+        if isBypassed { setBypassed(false) }
 
         // Always create a fresh engine to avoid state issues
         engine = AVAudioEngine()
@@ -212,10 +220,57 @@ final class MicProcessor {
         tapIsolation = clamped
         setIsolationParameter(clamped)
         currentIsolation = clamped
+        // If the level changes during an A/B bypass, the pending restore must
+        // land on the NEW value, not the stale pre-bypass one.
+        if isBypassed { bypassedIsolation = clamped }
     }
 
     func setClarity(_ level: ClarityLevel) {
         voiceChain.setClarity(level)
+        // Same for clarity chosen during a bypass: restore the NEW level.
+        if isBypassed { bypassedClarity = level }
+    }
+
+    // MARK: - Mute + A/B bypass (main thread)
+
+    // Broadcast-console style mute: the engine keeps running and the meter
+    // stays live, but the ring (and therefore BlackHole) receives silence.
+    // Mute is never persisted; the processor always starts unmuted.
+    func setMuted(_ muted: Bool) {
+        guard muted != isMuted else { return }
+        isMuted = muted
+        tapMuted = muted
+        FileLog.log("mute: \(muted ? "on" : "off")")
+    }
+
+    // A/B bypass: momentarily drop isolation to the wet floor (15, the
+    // existing clamp minimum) and suspend the clarity chain, so the user can
+    // compare processed vs raw. The previous isolation and clarity are stored
+    // and restored exactly; the temporary values are never written to
+    // currentIsolation or persisted anywhere.
+    func setBypassed(_ bypassed: Bool) {
+        guard bypassed != isBypassed else { return }
+        if bypassed {
+            isBypassed = true
+            bypassedIsolation = tapIsolation
+            bypassedClarity = voiceChain.currentLevel
+            tapIsolation = 15
+            setIsolationParameter(15)
+            voiceChain.setClarity(.off)
+            FileLog.log("bypass: on (isolation \(bypassedIsolation.map(String.init(_:)) ?? "?"), clarity \(bypassedClarity?.rawValue ?? "off"))")
+        } else {
+            isBypassed = false
+            if let iso = bypassedIsolation {
+                tapIsolation = iso
+                setIsolationParameter(iso)
+            }
+            if let clarity = bypassedClarity {
+                voiceChain.setClarity(clarity)
+            }
+            bypassedIsolation = nil
+            bypassedClarity = nil
+            FileLog.log("bypass: off")
+        }
     }
 
     private func setIsolationParameter(_ value: Float) {
@@ -259,13 +314,21 @@ final class MicProcessor {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
 
-        // Clarity lift runs on the processed signal before it reaches the
-        // ring (and therefore BlackHole); metering reads the post-chain audio.
-        voiceChain.process(channelData, count: frameCount)
+        // Meter the REAL samples first so the level stays live while muted
+        // (console-style monitoring). Then, if muted, silence the buffer so
+        // the ring (and BlackHole) receive zeros; the push still happens to
+        // keep ring timing and backlog behavior consistent.
+        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
+        if tapMuted {
+            for i in 0..<frameCount { channelData[i] = 0 }
+        } else {
+            // Clarity lift runs on the processed signal before it reaches the
+            // ring; metering reads the post-isolation audio.
+            voiceChain.process(channelData, count: frameCount)
+        }
 
         pushToRing(samples: channelData, count: frameCount)
 
-        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
         if tapAutoAdjust {
             runAutoAdjust(rms: rms)
         }

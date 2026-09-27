@@ -33,9 +33,9 @@ private struct GeneralTab: View {
                     .foregroundStyle(.secondary)
             }
             Section("Hotkeys") {
-                ForEach(AppAction.allCases, id: \.self) { action in
-                    LabeledContent(hotkeyLabel(for: action)) {
-                        Text(hotkeyCombo(for: action))
+                ForEach(HotkeyManager.Slot.allCases, id: \.self) { slot in
+                    LabeledContent(HotkeyManager.label(for: slot)) {
+                        Text(hotkeyCombo(for: slot))
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                     }
@@ -51,22 +51,13 @@ private struct GeneralTab: View {
         }
     }
 
-    private func hotkeyLabel(for action: AppAction) -> String {
-        switch action {
-        case .toggleEngine:  return "Start/stop processing"
-        case .cycleClarity:  return "Cycle clarity"
-        case .strengthUp:    return "Isolation strength up"
-        case .strengthDown:  return "Isolation strength down"
-        }
-    }
-
     /// Read-only display of the current binding. Carbon modifier bits are
     /// rendered as glyphs; unknown key codes fall back to their number.
-    private func hotkeyCombo(for action: AppAction) -> String {
+    private func hotkeyCombo(for slot: HotkeyManager.Slot) -> String {
         let defaults = UserDefaults.standard
-        let key = HotkeyManager.prefKey(for: action)
+        let key = HotkeyManager.prefKey(for: slot)
         let binding = defaults.string(forKey: key).flatMap(HotkeyManager.decode)
-            ?? HotkeyManager.defaultBinding(for: action)
+            ?? HotkeyManager.defaultBinding(for: slot)
 
         var glyphs = ""
         if binding.modifierMask & UInt32(controlKey) != 0 { glyphs += "\u{2303}" }  // ^

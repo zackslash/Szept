@@ -11,8 +11,44 @@ final class HotkeyManager {
 
     private let dispatch: (AppAction) -> Void
 
-    private var registrations: [AppAction: EventHotKeyRef] = [:]
+    private var registrations: [Slot: EventHotKeyRef] = [:]
     private var eventHandler: EventHandlerRef?
+
+    // MARK: - Hotkey slots
+
+    /// One registration per physical key combo. Every slot except
+    /// `bypassMomentary` is pressed-only (release events are ignored).
+    /// `bypassMomentary` is the ONLY slot with a release semantic: it fires
+    /// `.bypassOn` while held and `.bypassOff` on release (momentary A/B
+    /// comparison). The handler therefore installs both kEventHotKeyPressed
+    /// and kEventHotKeyReleased; per-slot `releaseAction == nil` keeps the
+    /// pressed-only behavior for all other slots.
+    enum Slot: CaseIterable {
+        case toggleEngine
+        case cycleClarity
+        case strengthUp
+        case strengthDown
+        case muteToggle
+        case bypassMomentary
+
+        /// Action fired when the combo is pressed. nil = press ignored.
+        var pressAction: AppAction? {
+            switch self {
+            case .toggleEngine:     return .toggleEngine
+            case .cycleClarity:     return .cycleClarity
+            case .strengthUp:       return .strengthUp
+            case .strengthDown:     return .strengthDown
+            case .muteToggle:       return .muteToggle
+            case .bypassMomentary:  return .bypassOn
+            }
+        }
+
+        /// Action fired when the combo is released. nil (every slot except
+        /// the momentary bypass) = release ignored.
+        var releaseAction: AppAction? {
+            self == .bypassMomentary ? .bypassOff : nil
+        }
+    }
 
     // MARK: - Bindings
 
@@ -21,21 +57,36 @@ final class HotkeyManager {
         var modifierMask: UInt32   // Carbon masks: cmdKey/shiftKey/optionKey/controlKey
     }
 
-    static func prefKey(for action: AppAction) -> String {
-        switch action {
-        case .toggleEngine:  return "hotkey.toggle"
-        case .cycleClarity:  return "hotkey.clarity"
-        case .strengthUp:    return "hotkey.strengthUp"
-        case .strengthDown:  return "hotkey.strengthDown"
+    static func prefKey(for slot: Slot) -> String {
+        switch slot {
+        case .toggleEngine:     return "hotkey.toggle"
+        case .cycleClarity:     return "hotkey.clarity"
+        case .strengthUp:       return "hotkey.strengthUp"
+        case .strengthDown:     return "hotkey.strengthDown"
+        case .muteToggle:       return "hotkey.mute"
+        case .bypassMomentary:  return "hotkey.bypass"
         }
     }
 
-    static func defaultBinding(for action: AppAction) -> Binding {
-        switch action {
-        case .toggleEngine:  return Binding(keyCode: UInt32(kVK_ANSI_N), modifierMask: UInt32(controlKey | optionKey))
-        case .cycleClarity:  return Binding(keyCode: UInt32(kVK_ANSI_C), modifierMask: UInt32(controlKey | optionKey))
-        case .strengthUp:    return Binding(keyCode: UInt32(kVK_ANSI_RightBracket), modifierMask: UInt32(controlKey | optionKey))
-        case .strengthDown:  return Binding(keyCode: UInt32(kVK_ANSI_LeftBracket), modifierMask: UInt32(controlKey | optionKey))
+    static func defaultBinding(for slot: Slot) -> Binding {
+        switch slot {
+        case .toggleEngine:     return Binding(keyCode: UInt32(kVK_ANSI_N), modifierMask: UInt32(controlKey | optionKey))
+        case .cycleClarity:     return Binding(keyCode: UInt32(kVK_ANSI_C), modifierMask: UInt32(controlKey | optionKey))
+        case .strengthUp:       return Binding(keyCode: UInt32(kVK_ANSI_RightBracket), modifierMask: UInt32(controlKey | optionKey))
+        case .strengthDown:     return Binding(keyCode: UInt32(kVK_ANSI_LeftBracket), modifierMask: UInt32(controlKey | optionKey))
+        case .muteToggle:       return Binding(keyCode: UInt32(kVK_ANSI_M), modifierMask: UInt32(controlKey | optionKey))
+        case .bypassMomentary:  return Binding(keyCode: UInt32(kVK_ANSI_B), modifierMask: UInt32(controlKey | optionKey))
+        }
+    }
+
+    static func label(for slot: Slot) -> String {
+        switch slot {
+        case .toggleEngine:     return "Start/stop processing"
+        case .cycleClarity:     return "Cycle clarity"
+        case .strengthUp:       return "Isolation strength up"
+        case .strengthDown:     return "Isolation strength down"
+        case .muteToggle:       return "Mute on/off"
+        case .bypassMomentary:  return "Bypass A/B (hold)"
         }
     }
 
@@ -115,19 +166,19 @@ final class HotkeyManager {
         }
     }
 
-    private var bindings: [AppAction: Binding] = [:]
+    private var bindings: [Slot: Binding] = [:]
 
-    /// Deterministic EventHotKeyID.id per action: its position in
-    /// `AppAction.allCases` plus 1 (never 0). NOT a hash: hashValue is
-    /// randomized per process and would make the fired ID unmatchable.
-    private func hotKeyNumericID(for action: AppAction) -> UInt32 {
-        UInt32(AppAction.allCases.firstIndex(of: action)! + 1)
+    /// Deterministic EventHotKeyID.id per slot: its position in
+    /// `Slot.allCases` plus 1 (never 0). NOT a hash: hashValue is randomized
+    /// per process and would make the fired ID unmatchable.
+    private func hotKeyNumericID(for slot: Slot) -> UInt32 {
+        UInt32(Slot.allCases.firstIndex(of: slot)! + 1)
     }
 
-    private func action(forNumericID id: UInt32) -> AppAction? {
+    private func slot(forNumericID id: UInt32) -> Slot? {
         let idx = Int(id) - 1
-        guard idx >= 0, idx < AppAction.allCases.count else { return nil }
-        return AppAction.allCases[idx]
+        guard idx >= 0, idx < Slot.allCases.count else { return nil }
+        return Slot.allCases[idx]
     }
 
     // MARK: - Lifecycle
@@ -148,27 +199,27 @@ final class HotkeyManager {
 
     // MARK: - Public API
 
-    /// Update the binding for one action: unregisters the old combo, persists
+    /// Update the binding for one slot: unregisters the old combo, persists
     /// the new one, and re-registers. Returns true if registration succeeded.
     @discardableResult
-    func rebind(action: AppAction, keyCode: UInt32, modifierMask: UInt32) -> Bool {
+    func rebind(slot: Slot, keyCode: UInt32, modifierMask: UInt32) -> Bool {
         let binding = Binding(keyCode: keyCode, modifierMask: modifierMask)
-        unregister(action)
-        bindings[action] = binding
-        UserDefaults.standard.set(Self.encode(binding), forKey: Self.prefKey(for: action))
-        return register(action: action, binding: binding)
+        unregister(slot)
+        bindings[slot] = binding
+        UserDefaults.standard.set(Self.encode(binding), forKey: Self.prefKey(for: slot))
+        return register(slot: slot, binding: binding)
     }
 
     // MARK: - Persistence
 
     private func loadBindings() {
         let defaults = UserDefaults.standard
-        for action in AppAction.allCases {
-            let key = Self.prefKey(for: action)
+        for slot in Slot.allCases {
+            let key = Self.prefKey(for: slot)
             if let raw = defaults.string(forKey: key), let binding = Self.decode(raw) {
-                bindings[action] = binding
+                bindings[slot] = binding
             } else {
-                bindings[action] = Self.defaultBinding(for: action)
+                bindings[slot] = Self.defaultBinding(for: slot)
             }
         }
     }
@@ -176,51 +227,59 @@ final class HotkeyManager {
     // MARK: - Carbon registration
 
     private func installEventHandler() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                 eventKind: UInt32(kEventHotKeyPressed))
+        // Both pressed AND released: the momentary bypass needs the release.
+        // Slots whose `releaseAction` is nil simply ignore release events, so
+        // they keep their pressed-only behavior.
+        var spec = [
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
+        ]
         // Pass self as userData (unretained: the manager is owned by the app
         // and lives for the process lifetime).
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), hotkeyEventHandler, 1, &spec, selfPtr, &eventHandler)
+        InstallEventHandler(GetApplicationEventTarget(), hotkeyEventHandler, 2, &spec, selfPtr, &eventHandler)
     }
 
     private func registerAll() {
-        for (action, binding) in bindings {
-            _ = register(action: action, binding: binding)
+        for (slot, binding) in bindings {
+            _ = register(slot: slot, binding: binding)
         }
     }
 
     @discardableResult
-    private func register(action: AppAction, binding: Binding) -> Bool {
-        let hotKeyID = EventHotKeyID(signature: Self.fourCC("Szpt"), id: hotKeyNumericID(for: action))
+    private func register(slot: Slot, binding: Binding) -> Bool {
+        let hotKeyID = EventHotKeyID(signature: Self.fourCC("Szpt"), id: hotKeyNumericID(for: slot))
         var ref: EventHotKeyRef?
         let err = RegisterEventHotKey(binding.keyCode, binding.modifierMask, hotKeyID,
                                       GetApplicationEventTarget(), 0, &ref)
         if err == noErr, let ref = ref {
-            registrations[action] = ref
+            registrations[slot] = ref
             return true
         }
         // The expected failure is eventHotKeyExistsErr (-9878): another app
         // already owns this combo. Never crash on a hotkey failure; anything
         // other than a conflict is logged so it isn't invisible.
         if err != OSStatus(eventHotKeyExistsErr) {
-            FileLog.log("hotkey: register failed for \(action) with OSStatus \(err)")
+            FileLog.log("hotkey: register failed for \(slot) with OSStatus \(err)")
         } else {
-            FileLog.log("hotkey: \(action) combo already owned by another app")
+            FileLog.log("hotkey: \(slot) combo already owned by another app")
         }
         return false
     }
 
-    private func unregister(_ action: AppAction) {
-        if let ref = registrations.removeValue(forKey: action) { UnregisterEventHotKey(ref) }
+    private func unregister(_ slot: Slot) {
+        if let ref = registrations.removeValue(forKey: slot) { UnregisterEventHotKey(ref) }
     }
 
     // MARK: - Dispatch
 
     /// Called by the Carbon C shim on the main run loop; routes through
-    /// ActionRouter on the main thread.
-    fileprivate func handleHotKeyEvent(numericID: UInt32) {
-        guard let action = action(forNumericID: numericID) else { return }
+    /// ActionRouter on the main thread. Presses map via `pressAction`,
+    /// releases only via `releaseAction` (momentary bypass only).
+    fileprivate func handleHotKeyEvent(numericID: UInt32, pressed: Bool) {
+        guard let slot = slot(forNumericID: numericID) else { return }
+        let action = pressed ? slot.pressAction : slot.releaseAction
+        guard let action else { return }
         DispatchQueue.main.async { [dispatch] in
             dispatch(action)
         }
@@ -243,7 +302,11 @@ private func hotkeyEventHandler(
     _ userData: UnsafeMutableRawPointer?
 ) -> OSStatus {
     guard let event, let userData else { return OSStatus(eventNotHandledErr) }
-    guard GetEventKind(event) == UInt32(kEventHotKeyPressed) else { return OSStatus(eventNotHandledErr) }
+    let kind = GetEventKind(event)
+    guard kind == UInt32(kEventHotKeyPressed) || kind == UInt32(kEventHotKeyReleased) else {
+        return OSStatus(eventNotHandledErr)
+    }
+    let pressed = kind == UInt32(kEventHotKeyPressed)
 
     var hotkeyID = EventHotKeyID()
     let status = GetEventParameter(event, EventParamName(kEventParamDirectObject),
@@ -253,6 +316,6 @@ private func hotkeyEventHandler(
     let numericID = hotkeyID.id
 
     let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()
-    manager.handleHotKeyEvent(numericID: numericID)
+    manager.handleHotKeyEvent(numericID: numericID, pressed: pressed)
     return noErr
 }
