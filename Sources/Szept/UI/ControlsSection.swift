@@ -7,14 +7,6 @@ struct ControlsSection: View {
     var body: some View {
         @Bindable var processor = appState.micProcessor
         VStack(alignment: .leading, spacing: 10) {
-            Toggle("Auto-adjust strength", isOn: $processor.autoAdjust)
-                .disabled(!processor.isRunning)
-                .onChange(of: processor.autoAdjust) { _, newValue in
-                    UserDefaults.standard.set(newValue, forKey: "autoAdjust")
-                }
-            Text("Rides strength to keep output loudness steady. Poor match for sudden noise such as barking.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             qualityRow(processor: processor)
         }
         .padding(.horizontal, 12)

@@ -86,7 +86,6 @@ private struct AudioTab: View {
                 }
             }
             Section("Isolation") {
-                Toggle("Auto-adjust strength", isOn: $autoAdjust)
                 LabeledContent("Strength") {
                     Picker("Strength", selection: $qualityPreset) {
                         Text("Gentle").tag("light")
