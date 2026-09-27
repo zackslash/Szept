@@ -129,12 +129,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             rootView: MenuView().environment(appState)
         )
 
-        // Size the panel to the SwiftUI content (MenuView fixes the width
-        // at 320). fittingSize forces a layout pass; without an explicit
-        // frame the menu item renders at zero height and nothing appears.
-        hostingView.sizingOptions = [.preferredContentSize]
-        var panelSize = hostingView.fittingSize
-        if panelSize.height < 100 { panelSize.height = 300 }
+        // Deterministic sizing: propose the fixed panel width and take the
+        // height SwiftUI actually needs via sizeThatFits. Ideal-size
+        // discovery (preferredContentSize/fittingSize) is unreliable here:
+        // it collapsed the panel to a zero-width sliver.
+        var panelSize = hostingView.sizeThatFits(
+            NSSize(width: 320, height: .greatestFiniteMagnitude)
+        )
+        panelSize.width = 320
+        if panelSize.height < 100 || panelSize.height.isInfinite { panelSize.height = 300 }
         hostingView.frame = NSRect(origin: .zero, size: panelSize)
 
         menuItem.view = hostingView
