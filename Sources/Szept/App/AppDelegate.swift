@@ -10,6 +10,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FileLog.log("app: didFinishLaunching")
+        if let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+           let icon = NSImage(contentsOfFile: iconPath) {
+            NSApp.applicationIconImage = icon
+        }
         registerDefaults()
         loadPreferencesIntoProcessor()
         setupStatusItem()

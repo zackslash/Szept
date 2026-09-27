@@ -16,11 +16,58 @@ struct SettingsView: View {
     }
 }
 
+private struct AboutCard: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            AppIconImage()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 48, height: 48)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Szept")
+                    .font(.subheadline.weight(.semibold))
+                Text("Version \(appVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Microphone noise isolation for calls.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+    }
+}
+
+/// Loads the bundled `AppIcon.icns` directly; SwiftUI `Image` cannot read
+/// `.icns` assets by name, and `NSApplication.icon` may not be set yet when
+/// the Settings window opens.
+private struct AppIconImage: View {
+    var body: some View {
+        Image(nsImage: Self.loadAppIcon())
+            .resizable()
+    }
+
+    private static func loadAppIcon() -> NSImage {
+        if let path = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+           let icon = NSImage(contentsOfFile: path) {
+            return icon
+        }
+        return NSImage(size: NSSize(width: 48, height: 48))
+    }
+}
+
 private struct GeneralTab: View {
     @AppStorage("launchAtLogin") private var launchAtLogin: Bool = false
 
     var body: some View {
         Form {
+            Section {
+                AboutCard()
+            }
             Section {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, enabled in

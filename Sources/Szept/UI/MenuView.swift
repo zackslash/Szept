@@ -52,32 +52,50 @@ struct MenuView: View {
     }
 
     private var footerSection: some View {
-        HStack {
-            Button("Open Mic Settings") {
-                appState.micModeMonitor.openMicModePicker()
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button {
+                    appState.micModeMonitor.openMicModePicker()
+                } label: {
+                    Text("Open Mic Settings")
+                }
+                .buttonStyle(.borderless)
+                .contentShape(Rectangle())
+                SettingsLink {
+                    Text("Settings…")
+                }
+                .buttonStyle(.borderless)
+                .contentShape(Rectangle())
+                Spacer()
             }
-            .buttonStyle(.borderless)
-            SettingsLink {
-                Text("Settings…")
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            Divider().padding(.horizontal, 12)
+
+            HStack(spacing: 16) {
+                Button(appState.micProcessor.isBypassed ? "A/B" : "Bypass") {
+                    appState.micProcessor.setBypassed(!appState.micProcessor.isBypassed)
+                }
+                .buttonStyle(.borderless)
+                .contentShape(Rectangle())
+                .disabled(!appState.micProcessor.isRunning)
+                Button(appState.micProcessor.isRunning ? "Stop" : "Start") {
+                    AppAction.toggleEngine.perform(on: appState)
+                }
+                .buttonStyle(.borderless)
+                .contentShape(Rectangle())
+                Button("Quit") {
+                    NSApp.terminate(nil)
+                }
+                .buttonStyle(.borderless)
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
-            Spacer()
-            Button(appState.micProcessor.isBypassed ? "A/B" : "Bypass") {
-                appState.micProcessor.setBypassed(!appState.micProcessor.isBypassed)
-            }
-            .buttonStyle(.borderless)
-            .disabled(!appState.micProcessor.isRunning)
-            Button(appState.micProcessor.isRunning ? "Stop" : "Start") {
-                AppAction.toggleEngine.perform(on: appState)
-            }
-            .buttonStyle(.borderless)
-            Button("Quit") {
-                NSApp.terminate(nil)
-            }
-            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 2)
     }
 }
 
