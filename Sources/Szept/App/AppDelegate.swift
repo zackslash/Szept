@@ -8,6 +8,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        FileLog.log("app: didFinishLaunching")
         registerDefaults()
         loadPreferencesIntoProcessor()
         setupStatusItem()
@@ -42,12 +43,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Permission + Auto-start
 
     private func checkMicPermission() {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        FileLog.log("permission: status \(status.rawValue) (0=notDetermined 1=restricted 2=denied 3=authorized)")
+        switch status {
         case .authorized:
             autoStartIfEnabled()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 DispatchQueue.main.async {
+                    FileLog.log("permission: prompt answered granted=\(granted)")
                     if granted {
                         self?.autoStartIfEnabled()
                     } else {
@@ -56,6 +60,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         case .denied, .restricted:
+            FileLog.log("permission: denied or restricted, showing denied card")
             appState.micPermissionDenied = true
         @unknown default:
             break
@@ -63,7 +68,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func autoStartIfEnabled() {
-        guard UserDefaults.standard.bool(forKey: "isProcessingEnabled") else { return }
+        guard UserDefaults.standard.bool(forKey: "isProcessingEnabled") else {
+            FileLog.log("autoStart: skipped, preference off")
+            return
+        }
+        FileLog.log("autoStart: scheduling in 0.5s")
 
         // Delay slightly to ensure audio system is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -73,9 +82,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 try self.appState.micProcessor.start()
                 let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
                 self.appState.micProcessor.applyQualityPreset(preset)
-                print("Auto-start succeeded")
+                FileLog.log("autoStart: succeeded")
             } catch {
-                print("Auto-start failed: \(error)")
+                FileLog.log("autoStart: failed: \(error.localizedDescription)")
                 self.appState.lastError = error.localizedDescription
                 // Reset the preference so it doesn't keep trying and failing
                 UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
