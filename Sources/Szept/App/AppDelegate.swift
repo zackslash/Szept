@@ -32,12 +32,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadPreferencesIntoProcessor() {
-        let gainDB = Float(UserDefaults.standard.double(forKey: "makeupGainDB"))
         // Auto-adjust is retired from the UI: it misfires on transient noise
         // such as barking. Force it off so a legacy stored toggle cannot
         // silently re-enable the controller.
         UserDefaults.standard.set(false, forKey: "autoAdjust")
-        appState.micProcessor.loadPreferences(gainDB: gainDB, autoAdjust: false)
+        appState.micProcessor.loadPreferences(autoAdjust: false)
     }
 
     // MARK: - Permission + Auto-start
