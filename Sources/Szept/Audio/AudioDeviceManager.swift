@@ -42,9 +42,10 @@ final class AudioDeviceManager {
 
         let buffer = UnsafeMutableBufferPointer<AudioDeviceID>.allocate(capacity: count)
         defer { buffer.deallocate() }
+        guard let deviceIDPointer = buffer.baseAddress else { return [] }
 
         status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, buffer.baseAddress
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, deviceIDPointer
         )
         guard status == noErr else { throw AudioDeviceError.queryFailed(status) }
 

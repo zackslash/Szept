@@ -13,13 +13,20 @@ Input device -> AUSoundIsolation -> BlackHole -> call app
 
 - macOS 14 or newer, Apple Silicon
 - BlackHole, installed separately from https://existential.audio
-- Xcode 15 or newer to build
+- Swift 6 toolchain to build: Xcode 16 or newer, or Command Line Tools
 
 ## Build and run
 
-1. Open Szept/Szept.xcodeproj in Xcode
-2. Press Cmd+R
-3. Grant microphone access when prompted
+Release build from the command line:
+
+    swift build -c release
+
+Or open the repository folder in Xcode, which reads Package.swift, and run
+the Szept scheme. To get a launchable app bundle run:
+
+    bash scripts/package.sh
+
+Grant microphone access when prompted.
 
 ## Using it
 

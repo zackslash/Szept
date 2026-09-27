@@ -169,8 +169,12 @@ final class MicProcessor {
     }
 
     private func setDevice(_ deviceID: AudioDeviceID, on node: AVAudioIONode) throws {
+        guard let au = node.audioUnit else {
+            throw NSError(domain: "MicProcessor", code: 12,
+                          userInfo: [NSLocalizedDescriptionKey: "Audio IO node has no underlying audio unit"])
+        }
         var id = deviceID
-        let status = AudioUnitSetProperty(node.audioUnit, kAudioOutputUnitProperty_CurrentDevice,
+        let status = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
                                           kAudioUnitScope_Global, 0, &id,
                                           UInt32(MemoryLayout<AudioDeviceID>.size))
         guard status == noErr else {
