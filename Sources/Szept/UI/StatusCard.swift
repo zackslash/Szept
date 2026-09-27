@@ -3,7 +3,6 @@ import SwiftUI
 struct StatusCard: View {
     let mode: SzeptMode
     let description: String
-    var isMuted: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -33,9 +32,6 @@ struct StatusCard: View {
     }
 
     private var dotColor: Color {
-        // Muted overrides the mode color: audible state is off even though
-        // the engine is still running and monitoring the mic.
-        if isMuted { return .orange }
         switch mode {
         case .enhanced:   return .green
         case .standalone: return .blue

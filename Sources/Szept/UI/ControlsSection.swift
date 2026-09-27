@@ -2,7 +2,7 @@ import SwiftUI
 
 struct ControlsSection: View {
     @Environment(AppState.self) var appState
-    @AppStorage("qualityPreset") private var qualityPreset: String = "balanced"
+    @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
 
     var body: some View {
         @Bindable var processor = appState.micProcessor

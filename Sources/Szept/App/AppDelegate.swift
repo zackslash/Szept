@@ -53,8 +53,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func registerDefaults() {
         UserDefaults.standard.register(defaults: [
-            "makeupGainDB": 6.0,
-            "autoAdjust": false,
             "launchAtLogin": false,
             "isProcessingEnabled": true,
             "qualityPreset": "aggressive",
@@ -63,11 +61,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadPreferencesIntoProcessor() {
-        // Auto-adjust is retired from the UI: it misfires on transient noise
-        // such as barking. Force it off so a legacy stored toggle cannot
-        // silently re-enable the controller.
-        UserDefaults.standard.set(false, forKey: "autoAdjust")
-        appState.micProcessor.loadPreferences(autoAdjust: false)
         let clarityRaw = UserDefaults.standard.string(forKey: "clarityLevel") ?? "off"
         appState.micProcessor.setClarity(ClarityLevel(rawValue: clarityRaw) ?? .off)
     }
@@ -110,50 +103,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             do {
-                try self.resolveAndAssignDevices()
+                try self.appState.resolveAndAssignDevices()
                 try self.appState.micProcessor.start()
                 let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
                 self.appState.micProcessor.applyQualityPreset(preset)
                 FileLog.log("autoStart: succeeded")
             } catch {
-                FileLog.log("autoStart: failed: \(error.localizedDescription)")
-                self.appState.lastError = error.localizedDescription
-                // Reset the preference so it doesn't keep trying and failing
-                UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
+                // A stale device (unplugged mic, vanished BlackHole) is the
+                // overwhelmingly likely cause; re-resolve and retry ONCE.
+                FileLog.log("autoStart: failed: \(error.localizedDescription); retrying after device re-resolution")
+                self.startWithDeviceRetry()
             }
         }
     }
 
-    /// Resolves the configured input/output devices and assigns them to the
-    /// processor. Throws (without starting the engine) if no usable output
-    /// device exists — audio is never routed to the system default output,
-    /// which would blast the processed mic from the speakers.
-    func resolveAndAssignDevices() throws {
-        let inputUID = UserDefaults.standard.string(forKey: "inputDeviceUID") ?? ""
-        if !inputUID.isEmpty {
-            if let input = try AudioDeviceManager.findDevice(uid: inputUID) {
-                appState.micProcessor.inputDeviceID = input.id
-            } else {
-                throw NSError(domain: "AppDelegate", code: 20,
-                              userInfo: [NSLocalizedDescriptionKey: "Selected input device not found. Reconnect it or pick another microphone in Settings."])
-            }
-        } else {
-            appState.micProcessor.inputDeviceID = nil
-        }
-
-        let outputUID = UserDefaults.standard.string(forKey: "outputDeviceUID") ?? ""
-        if !outputUID.isEmpty {
-            if let output = try AudioDeviceManager.findDevice(uid: outputUID) {
-                appState.micProcessor.outputDeviceID = output.id
-            } else {
-                throw NSError(domain: "AppDelegate", code: 21,
-                              userInfo: [NSLocalizedDescriptionKey: "Selected output device not found. Reconnect it or pick another device in Settings."])
-            }
-        } else if let blackHole = try AudioDeviceManager.firstBlackHole() {
-            appState.micProcessor.outputDeviceID = blackHole.id
-        } else {
-            throw NSError(domain: "AppDelegate", code: 22,
-                          userInfo: [NSLocalizedDescriptionKey: "No output device found. Install BlackHole (existential.audio/blackhole) or pick a device in Settings."])
+    private func startWithDeviceRetry() {
+        do {
+            try appState.resolveAndAssignDevices()
+            try appState.micProcessor.start()
+            let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
+            appState.micProcessor.applyQualityPreset(preset)
+            FileLog.log("autoStart: succeeded after device re-resolution")
+        } catch {
+            FileLog.log("autoStart: failed after retry: \(error.localizedDescription)")
+            appState.lastError = error.localizedDescription
+            // Reset the preference so it doesn't keep trying and failing
+            UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
         }
     }
 

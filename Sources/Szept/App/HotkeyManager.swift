@@ -28,7 +28,6 @@ final class HotkeyManager {
         case cycleClarity
         case strengthUp
         case strengthDown
-        case muteToggle
         case bypassMomentary
 
         /// Action fired when the combo is pressed. nil = press ignored.
@@ -38,7 +37,6 @@ final class HotkeyManager {
             case .cycleClarity:     return .cycleClarity
             case .strengthUp:       return .strengthUp
             case .strengthDown:     return .strengthDown
-            case .muteToggle:       return .muteToggle
             case .bypassMomentary:  return .bypassOn
             }
         }
@@ -63,7 +61,6 @@ final class HotkeyManager {
         case .cycleClarity:     return "hotkey.clarity"
         case .strengthUp:       return "hotkey.strengthUp"
         case .strengthDown:     return "hotkey.strengthDown"
-        case .muteToggle:       return "hotkey.mute"
         case .bypassMomentary:  return "hotkey.bypass"
         }
     }
@@ -74,7 +71,6 @@ final class HotkeyManager {
         case .cycleClarity:     return Binding(keyCode: UInt32(kVK_ANSI_C), modifierMask: UInt32(controlKey | optionKey))
         case .strengthUp:       return Binding(keyCode: UInt32(kVK_ANSI_RightBracket), modifierMask: UInt32(controlKey | optionKey))
         case .strengthDown:     return Binding(keyCode: UInt32(kVK_ANSI_LeftBracket), modifierMask: UInt32(controlKey | optionKey))
-        case .muteToggle:       return Binding(keyCode: UInt32(kVK_ANSI_M), modifierMask: UInt32(controlKey | optionKey))
         case .bypassMomentary:  return Binding(keyCode: UInt32(kVK_ANSI_B), modifierMask: UInt32(controlKey | optionKey))
         }
     }
@@ -85,7 +81,6 @@ final class HotkeyManager {
         case .cycleClarity:     return "Cycle clarity"
         case .strengthUp:       return "Isolation strength up"
         case .strengthDown:     return "Isolation strength down"
-        case .muteToggle:       return "Mute on/off"
         case .bypassMomentary:  return "Bypass A/B (hold)"
         }
     }
@@ -197,19 +192,6 @@ final class HotkeyManager {
         if let handler = eventHandler { RemoveEventHandler(handler) }
     }
 
-    // MARK: - Public API
-
-    /// Update the binding for one slot: unregisters the old combo, persists
-    /// the new one, and re-registers. Returns true if registration succeeded.
-    @discardableResult
-    func rebind(slot: Slot, keyCode: UInt32, modifierMask: UInt32) -> Bool {
-        let binding = Binding(keyCode: keyCode, modifierMask: modifierMask)
-        unregister(slot)
-        bindings[slot] = binding
-        UserDefaults.standard.set(Self.encode(binding), forKey: Self.prefKey(for: slot))
-        return register(slot: slot, binding: binding)
-    }
-
     // MARK: - Persistence
 
     private func loadBindings() {
@@ -285,7 +267,7 @@ final class HotkeyManager {
         }
     }
 
-    private static func fourCC(_ s: String) -> OSType {
+    fileprivate static func fourCC(_ s: String) -> OSType {
         let bytes = Array(s.utf8)
         guard bytes.count >= 4 else { return 0 }
         return OSType(bytes[0]) << 24 | OSType(bytes[1]) << 16 | OSType(bytes[2]) << 8 | OSType(bytes[3])
@@ -313,6 +295,9 @@ private func hotkeyEventHandler(
                                    EventParamType(typeEventHotKeyID), nil,
                                    MemoryLayout<EventHotKeyID>.size, nil, &hotkeyID)
     guard status == noErr else { return OSStatus(eventNotHandledErr) }
+    // Ignore events whose signature is not ours (defensive: Carbon delivers
+    // hotkey events by target, but never trust a foreign signature).
+    guard hotkeyID.signature == HotkeyManager.fourCC("Szpt") else { return OSStatus(eventNotHandledErr) }
     let numericID = hotkeyID.id
 
     let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()

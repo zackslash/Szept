@@ -8,9 +8,6 @@ enum AppAction: CaseIterable {
     case cycleClarity
     case strengthUp
     case strengthDown
-    case muteOn
-    case muteOff
-    case muteToggle
     case bypassOn
     case bypassOff
     case bypassToggle
@@ -28,9 +25,6 @@ enum AppAction: CaseIterable {
         case ("clarity", _):       return .cycleClarity
         case ("strength", "down"): return .strengthDown
         case ("strength", _):      return .strengthUp
-        case ("mute", "on"):       return .muteOn
-        case ("mute", "off"):      return .muteOff
-        case ("mute", _):          return .muteToggle
         case ("bypass", "on"):     return .bypassOn
         case ("bypass", "off"):    return .bypassOff
         case ("bypass", _):        return .bypassToggle
@@ -49,12 +43,6 @@ enum AppAction: CaseIterable {
             shiftStrength(on: appState, up: true)
         case .strengthDown:
             shiftStrength(on: appState, up: false)
-        case .muteOn:
-            appState.micProcessor.setMuted(true)
-        case .muteOff:
-            appState.micProcessor.setMuted(false)
-        case .muteToggle:
-            appState.micProcessor.setMuted(!appState.micProcessor.isMuted)
         case .bypassOn:
             appState.micProcessor.setBypassed(true)
         case .bypassOff:
@@ -78,8 +66,24 @@ enum AppAction: CaseIterable {
                 appState.lastError = nil
                 defaults.set(true, forKey: "isProcessingEnabled")
             } catch {
-                appState.lastError = "Failed to start: \(error.localizedDescription)"
+                // A stale device (unplugged mic, vanished BlackHole) is the
+                // overwhelmingly likely cause; re-resolve and retry ONCE.
+                startWithDeviceRetry(on: appState, preference: defaults)
             }
+        }
+    }
+
+    private func startWithDeviceRetry(on appState: AppState, preference: UserDefaults) {
+        do {
+            try appState.resolveAndAssignDevices()
+            try appState.micProcessor.start()
+            appState.lastError = nil
+            preference.set(true, forKey: "isProcessingEnabled")
+            FileLog.log("engine: start succeeded after device re-resolution")
+        } catch {
+            FileLog.log("engine: start failed after retry: \(error.localizedDescription)")
+            appState.lastError = "Failed to start: \(error.localizedDescription)"
+            preference.set(false, forKey: "isProcessingEnabled")
         }
     }
 

@@ -23,8 +23,7 @@ struct MenuView: View {
             } else {
                 StatusCard(
                     mode: appState.currentMode,
-                    description: appState.statusDescription,
-                    isMuted: appState.micProcessor.isMuted
+                    description: appState.statusDescription
                 )
             }
             if let errorMessage = appState.lastError {
@@ -63,18 +62,13 @@ struct MenuView: View {
             }
             .buttonStyle(.borderless)
             Spacer()
-            Button(appState.micProcessor.isMuted ? "Unmute" : "Mute") {
-                appState.micProcessor.setMuted(!appState.micProcessor.isMuted)
-            }
-            .buttonStyle(.borderless)
-            .disabled(!appState.micProcessor.isRunning)
             Button(appState.micProcessor.isBypassed ? "A/B" : "Bypass") {
                 appState.micProcessor.setBypassed(!appState.micProcessor.isBypassed)
             }
             .buttonStyle(.borderless)
             .disabled(!appState.micProcessor.isRunning)
             Button(appState.micProcessor.isRunning ? "Stop" : "Start") {
-                toggleEngine()
+                AppAction.toggleEngine.perform(on: appState)
             }
             .buttonStyle(.borderless)
             Button("Quit") {
@@ -84,23 +78,6 @@ struct MenuView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-    }
-
-    private func toggleEngine() {
-        if appState.micProcessor.isRunning {
-            appState.micProcessor.stop()
-            appState.lastError = nil
-            UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
-        } else {
-            do {
-                try appState.micProcessor.start()
-                appState.lastError = nil
-                UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
-            } catch {
-                appState.lastError = "Failed to start: \(error.localizedDescription)"
-                print("Engine start failed: \(error)")
-            }
-        }
     }
 }
 

@@ -2,16 +2,6 @@ import Accelerate
 import Foundation
 
 enum DSP {
-    /// Apply linear gain to samples in-place using vDSP.
-    static func applyMakeupGain(
-        samples: UnsafeMutablePointer<Float>,
-        count: Int,
-        gainLinear: Float
-    ) {
-        var gain = gainLinear
-        vDSP_vsmul(samples, 1, &gain, samples, 1, vDSP_Length(count))
-    }
-
     /// Apply tanh soft limiting in-place. Threshold controls the knee point.
     static func applySoftLimiter(
         samples: UnsafeMutablePointer<Float>,

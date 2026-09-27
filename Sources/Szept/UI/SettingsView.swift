@@ -82,7 +82,6 @@ private struct GeneralTab: View {
 
 private struct AudioTab: View {
     @Environment(AppState.self) private var appState
-    @AppStorage("autoAdjust") private var autoAdjust: Bool = false
     @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
     @AppStorage("inputDeviceUID") private var inputDeviceUID: String = ""
     @AppStorage("outputDeviceUID") private var outputDeviceUID: String = ""

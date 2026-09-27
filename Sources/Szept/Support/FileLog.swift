@@ -4,7 +4,7 @@ import Foundation
 /// build, so key lifecycle events also land in ~/Library/Logs/Szept.log,
 /// which can be read over SSH after a failure.
 enum FileLog {
-    private static let queue = DispatchQueue(label: "dev.kocheck.Szept.filelog")
+    private static let queue = DispatchQueue(label: "dev.zackslash.Szept.filelog")
     private static var handle: FileHandle?
 
     private static func openHandle() -> FileHandle? {
@@ -17,6 +17,12 @@ enum FileLog {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
         handle = try? FileHandle(forWritingTo: url)
+        // Cap the log: an oversized file from a previous run is truncated to
+        // empty before appending (simplest correct retention).
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? UInt64, size > 1_000_000 {
+            try? handle?.truncate(atOffset: 0)
+        }
         try? handle?.seekToEndOfFile()
         return handle
     }

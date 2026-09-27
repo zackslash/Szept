@@ -11,21 +11,19 @@ final class MicProcessor {
     var isRunning: Bool = false
     var outputLevel: Float = 0
     var currentIsolation: Float = 50
-    private(set) var isMuted: Bool = false
     private(set) var isBypassed: Bool = false
     // Pre-bypass state for exact restore; nil while not bypassed.
     private var bypassedIsolation: Float?
     private var bypassedClarity: ClarityLevel?
 
-    var autoAdjust: Bool = false {
-        didSet { tapAutoAdjust = autoAdjust }
-    }
-
     // MARK: - Audio thread state (read from callbacks; nonisolated(unsafe))
 
-    nonisolated(unsafe) private var tapAutoAdjust: Bool = false
     nonisolated(unsafe) private var tapIsolation: Float = 50
-    nonisolated(unsafe) private var tapMuted: Bool = false
+    // Meter throttle state, owned by the render thread: only send the level
+    // to the main thread when it meaningfully changed, at most every few
+    // buffers, or when it drops back to silence.
+    nonisolated(unsafe) private var lastSentRMS: Float = 0
+    nonisolated(unsafe) private var lastMeterFrame: Int = 0
 
     // MARK: - Clarity ("Broadcast Voice")
 
@@ -40,7 +38,7 @@ final class MicProcessor {
 
     private var engine = AVAudioEngine()
     private var isolationUnit: AVAudioUnitEffect?
-    private let logger = Logger(subsystem: "dev.kocheck.Szept", category: "MicProcessor")
+    private let logger = Logger(subsystem: "dev.zackslash.Szept", category: "MicProcessor")
 
     // MARK: - Dedicated output unit (owned by us, invisible to the engine)
     //
@@ -77,9 +75,8 @@ final class MicProcessor {
 
         FileLog.log("start: beginning")
 
-        // Mute and bypass never survive a restart: always start unmuted and
-        // un-bypassed (this also restores any pre-bypass isolation/clarity).
-        if isMuted { setMuted(false) }
+        // Bypass never survives a restart: always start un-bypassed (this
+        // also restores any pre-bypass isolation/clarity).
         if isBypassed { setBypassed(false) }
 
         // Always create a fresh engine to avoid state issues
@@ -200,12 +197,6 @@ final class MicProcessor {
         logger.notice("MicProcessor stopped")
     }
 
-    // MARK: - Preference loading (call before start())
-
-    func loadPreferences(autoAdjust: Bool) {
-        self.autoAdjust = autoAdjust
-    }
-
     func applyQualityPreset(_ preset: String) {
         let initialIsolation: Float
         switch preset {
@@ -234,17 +225,7 @@ final class MicProcessor {
         if isBypassed { bypassedClarity = level }
     }
 
-    // MARK: - Mute + A/B bypass (main thread)
-
-    // Broadcast-console style mute: the engine keeps running and the meter
-    // stays live, but the ring (and therefore BlackHole) receives silence.
-    // Mute is never persisted; the processor always starts unmuted.
-    func setMuted(_ muted: Bool) {
-        guard muted != isMuted else { return }
-        isMuted = muted
-        tapMuted = muted
-        FileLog.log("mute: \(muted ? "on" : "off")")
-    }
+    // MARK: - A/B bypass (main thread)
 
     // A/B bypass: momentarily drop isolation to the wet floor (15, the
     // existing clamp minimum) and suspend the clarity chain, so the user can
@@ -317,32 +298,40 @@ final class MicProcessor {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
 
-        // Meter the REAL samples first so the level stays live while muted
-        // (console-style monitoring). Then, if muted, silence the buffer so
-        // the ring (and BlackHole) receive zeros; the push still happens to
-        // keep ring timing and backlog behavior consistent.
-        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
-        if tapMuted {
-            for i in 0..<frameCount { channelData[i] = 0 }
-        } else {
-            // Clarity lift runs on the processed signal before it reaches the
-            // ring; metering reads the post-isolation audio.
-            voiceChain.process(channelData, count: frameCount)
-        }
+        // Clarity lift runs on the processed signal before it reaches the
+        // ring, followed by a gentle safety limiter; metering reads the
+        // post-chain audio.
+        voiceChain.process(channelData, count: frameCount)
+        DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 1.0)
 
         pushToRing(samples: channelData, count: frameCount)
 
-        if tapAutoAdjust {
-            runAutoAdjust(rms: rms)
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.outputLevel = rms
+        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
+
+        // Rate-limit main-thread meter updates: send on a meaningful change,
+        // at least every few buffers so the meter keeps moving, and promptly
+        // on a drop back to silence. Both scalars are render-thread-owned.
+        let framesSinceSend = lastMeterFrame
+        let shouldSend = abs(rms - lastSentRMS) > 0.02
+            || framesSinceSend >= 4
+            || (rms < 0.001 && lastSentRMS >= 0.001)
+        if shouldSend {
+            lastSentRMS = rms
+            lastMeterFrame = 0
+            DispatchQueue.main.async { [weak self] in
+                self?.outputLevel = rms
+            }
+        } else {
+            lastMeterFrame = framesSinceSend + 1
         }
     }
 
     private nonisolated func pushToRing(samples: UnsafePointer<Float>, count: Int) {
         guard let ring else { return }
-        let available = (ringCapacity + ringRead - ringWrite - 1 + ringCapacity) % ringCapacity
+        // Acquire: observe the samples before trusting the read index.
+        OSMemoryBarrier()
+        let readIndex = ringRead
+        let available = (ringCapacity + readIndex - ringWrite - 1 + ringCapacity) % ringCapacity
         let n = min(count, available)
         for i in 0..<n {
             ring[(ringWrite + i) % ringCapacity] = samples[i]
@@ -350,27 +339,6 @@ final class MicProcessor {
         // Release: publish the samples before the write index.
         OSMemoryBarrier()
         ringWrite = (ringWrite + n) % ringCapacity
-    }
-
-    // MARK: - Auto-adjust (retired from UI, kept inert)
-
-    private nonisolated func runAutoAdjust(rms: Float) {
-        let targetRMS: Float = 0.1
-        let deadband: Float = 0.02
-        let stepSize: Float = 0.5
-
-        let previousIsolation = tapIsolation
-        if rms < targetRMS - deadband {
-            tapIsolation = max(15, tapIsolation - stepSize)
-        } else if rms > targetRMS + deadband {
-            tapIsolation = min(85, tapIsolation + stepSize)
-        }
-        let newIsolation = tapIsolation
-        guard newIsolation != previousIsolation else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.setIsolationParameter(newIsolation)
-            self?.currentIsolation = newIsolation
-        }
     }
 
     // MARK: - Dedicated output unit (consumer)
@@ -382,8 +350,10 @@ final class MicProcessor {
         }
 
         // Match the device's nominal rate to the engine input rate so the
-        // ring never needs resampling. Best effort; then read back the
-        // device's actual rate and use THAT for the stream format.
+        // ring never needs resampling. Best effort; the stream format then
+        // uses the ENGINE/ring rate we actually feed, not the device's
+        // read-back rate (a mismatch would make the device consume the ring
+        // at the wrong speed).
         alignDeviceSampleRate(deviceID, to: sampleRate)
         let actualRate = deviceSampleRate(deviceID) ?? sampleRate
         FileLog.log("output: engine rate \(sampleRate), device rate \(actualRate)")
@@ -421,7 +391,7 @@ final class MicProcessor {
         // 2ch non-interleaved float32: bytes-per-frame/packet describe one
         // channel's sample (4 bytes), not a stereo frame (8).
         var asbd = AudioStreamBasicDescription(
-            mSampleRate: actualRate,
+            mSampleRate: sampleRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kLinearPCMFormatFlagIsNonInterleaved,
             mBytesPerPacket: 4,

@@ -172,9 +172,13 @@ final class VoiceChain {
     private var deEsser = DeEsser()
 
     /// Arm the chain with the render sample rate. Call from main before/at
-    /// engine start; coefficients are (re)built on the render thread.
+    /// engine start (never while running); forces a coefficient rebuild at
+    /// the next buffer so stale old-rate coefficients never render.
     func configure(sampleRate: Float) {
         self.sampleRate = sampleRate
+        appliedLevel = nil
+        presence.reset()
+        deEsser.reset()
     }
 
     /// Set the clarity level. Main thread only; plain scalar store (atomic on
