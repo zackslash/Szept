@@ -33,16 +33,16 @@ struct StatusCard: View {
 
     private var dotColor: Color {
         switch mode {
-        case .enhanced:   return .green
-        case .standalone: return .yellow
+        case .enhanced:   return .blue
+        case .standalone: return .green
         case .off:        return Color(.systemGray)
         }
     }
 
     private var modeLabel: String {
         switch mode {
-        case .enhanced:   return "Enhanced"
-        case .standalone: return "Standalone"
+        case .enhanced:   return "Szept + Voice Isolation"
+        case .standalone: return "Szept active"
         case .off:        return "Off"
         }
     }

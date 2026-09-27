@@ -148,8 +148,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem?.button else { return }
         let symbolName: String
         switch appState.currentMode {
-        case .enhanced:    symbolName = "checkmark.shield.fill"
-        case .standalone:  symbolName = "waveform.circle.fill"
+        case .enhanced:    symbolName = "waveform.circle.fill"
+        case .standalone:  symbolName = "checkmark.shield.fill"
         case .off:         symbolName = "waveform.circle"
         }
         let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Szept")

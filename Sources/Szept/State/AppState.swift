@@ -27,7 +27,7 @@ final class AppState {
 
     var statusDescription: String {
         switch currentMode {
-        case .enhanced:   return "Voice Isolation + Szept active"
+        case .enhanced:   return "Szept active. System Voice Isolation is also on."
         case .standalone: return "Szept processing active"
         case .off:        return "Processing off"
         }
