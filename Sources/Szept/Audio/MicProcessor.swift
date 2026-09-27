@@ -13,6 +13,9 @@ final class MicProcessor {
     var currentIsolation: Float = 50
     private(set) var isMuted: Bool = false
     private(set) var isBypassed: Bool = false
+    // Pre-bypass state for exact restore; nil while not bypassed.
+    private var bypassedIsolation: Float?
+    private var bypassedClarity: ClarityLevel?
 
     var autoAdjust: Bool = false {
         didSet { tapAutoAdjust = autoAdjust }
