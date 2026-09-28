@@ -114,6 +114,7 @@ private struct AudioTab: View {
     @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
     @AppStorage("inputDeviceUID") private var inputDeviceUID: String = ""
     @AppStorage("outputDeviceUID") private var outputDeviceUID: String = ""
+    @AppStorage("useAggregateDevice") private var useAggregateDevice: Bool = true
     @AppStorage("clarityLevel") private var clarityLevel: String = "off"
 
     @State private var inputDevices: [AudioDeviceInfo] = []
@@ -143,6 +144,13 @@ private struct AudioTab: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                Toggle("Drift-free output (aggregate device)", isOn: $useAggregateDevice)
+                    .onChange(of: useAggregateDevice) { _, enabled in
+                        appState.micProcessor.setUseAggregate(enabled)
+                    }
+                Text("Bridges the input and BlackHole on one clock. Takes effect on the next start. Turn off if output stops working.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Clarity") {
                 LabeledContent("Broadcast voice") {

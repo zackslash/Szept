@@ -40,6 +40,12 @@ final class LifecycleObserver {
         observeSleepWake()
         observeEngineConfiguration()
         observeDeviceList()
+        // Prime the snapshot so our own first aggregate creation does not
+        // look like an external device-list change and trigger a spurious
+        // rebuild right after the first start.
+        lastExternalDeviceUIDs = Set(
+            ((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid)
+        ).subtracting([AudioDeviceManager.aggregateUID])
         FileLog.log("lifecycle: observer installed")
     }
 
@@ -108,6 +114,11 @@ final class LifecycleObserver {
     }
 
     private var deviceListListenerInstalled = false
+    // External device UIDs as of the last device-list event, with our own
+    // aggregate filtered out. Our own aggregate create/destroy calls fire
+    // this same listener; comparing filtered sets keeps them invisible to
+    // the rebuild logic so they cannot trigger a stop/start churn loop.
+    private var lastExternalDeviceUIDs: Set<String> = []
 
     /// Coarse HAL signal that the device list changed (USB blip, coreaudiod
     /// restart). Routed through the same debounced rebuild as the engine
@@ -124,7 +135,14 @@ final class LifecycleObserver {
             AudioObjectID(kAudioObjectSystemObject), &address, .main
         ) { [weak self] _, _ in
             guard let self, let appState = self.appState else { return }
-            guard appState.micProcessor.isRunning else { return }
+            // Re-enumerate and filter out our own aggregate from BOTH the
+            // snapshot and the current set; update the snapshot on every
+            // event regardless.
+            let current = Set(((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid))
+            let filteredCurrent = current.subtracting([AudioDeviceManager.aggregateUID])
+            let filteredLast = self.lastExternalDeviceUIDs.subtracting([AudioDeviceManager.aggregateUID])
+            self.lastExternalDeviceUIDs = filteredCurrent
+            guard appState.micProcessor.isRunning, filteredCurrent != filteredLast else { return }
             self.scheduleRebuild(reason: "system device list changed")
         }
     }

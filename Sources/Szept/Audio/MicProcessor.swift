@@ -34,6 +34,44 @@ final class MicProcessor {
     var inputDeviceID: AudioDeviceID?
     var outputDeviceID: AudioDeviceID?
 
+    // MARK: - Aggregate device (drift-free output bridge)
+
+    // The mic interface and BlackHole run on unsynchronised clocks, so an
+    // SPSC ring bridging them accumulates drift and the user hears periodic
+    // blips. When enabled and both device UIDs resolve, we build a private
+    // aggregate device with the INPUT as clock master and route the OUTPUT
+    // unit at it instead of BlackHole; producer and consumer then share one
+    // crystal and no drift accumulates by construction. The engine stays
+    // exactly as it is (still pinned to the interface directly). Any
+    // aggregate failure falls back to direct BlackHole routing; a start is
+    // never failed because of an aggregate problem.
+    private var aggregateDeviceID: AudioDeviceID?
+    // Offset of the BlackHole member's channels within the aggregate's
+    // output channel list (the input sub-device's own output count).
+    private var aggregateChannelOffset: UInt32 = 0
+    private var aggregateChannelCount: UInt32 = 0
+
+    /// Destroy the aggregate we created, if any. Keeps the invariant that
+    /// aggregateDeviceID is non-nil only while the engine is running.
+    private func destroyAggregateIfNeeded() {
+        if let id = aggregateDeviceID {
+            aggregateDeviceID = nil
+            aggregateChannelOffset = 0
+            aggregateChannelCount = 0
+            AudioDeviceManager.destroyAggregateDevice(id: id)
+        }
+    }
+
+    /// Preference-backed drift-fix switch (default on). Main thread only.
+    var useAggregateDevice: Bool {
+        get { UserDefaults.standard.object(forKey: "useAggregateDevice") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "useAggregateDevice") }
+    }
+
+    func setUseAggregate(_ enabled: Bool) {
+        useAggregateDevice = enabled
+    }
+
     // MARK: - AVAudioEngine
 
     private var engine = AVAudioEngine()
@@ -93,6 +131,16 @@ final class MicProcessor {
         }
         FileLog.log("start: output device id \(outputDeviceID!)")
 
+        // Drift fix: build the private aggregate (input as clock master)
+        // when enabled and both UIDs resolve; the output unit below will
+        // then target the aggregate instead of BlackHole.
+        if useAggregateDevice {
+            setupAggregateDevice()
+        } else {
+            // Flag turned off between runs: drop any leftover aggregate.
+            destroyAggregateIfNeeded()
+        }
+
         do {
             if let id = inputDeviceID {
                 try setDevice(id, on: engine.inputNode)
@@ -100,6 +148,7 @@ final class MicProcessor {
             }
         } catch {
             FileLog.log("start: input device set failed: \(error.localizedDescription)")
+            destroyAggregateIfNeeded()
             isolationUnit = nil
             throw error
         }
@@ -112,6 +161,7 @@ final class MicProcessor {
         let inputFormat = engine.inputNode.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
             FileLog.log("start: invalid input format")
+            destroyAggregateIfNeeded()
             engine.detach(unit)
             isolationUnit = nil
             throw NSError(domain: "MicProcessor", code: 1,
@@ -155,6 +205,7 @@ final class MicProcessor {
             FileLog.log("start: engine.start failed: \(error.localizedDescription)")
             unit.removeTap(onBus: 0)
             engine.detach(unit)
+            destroyAggregateIfNeeded()
             isolationUnit = nil
             throw error
         }
@@ -181,6 +232,9 @@ final class MicProcessor {
         FileLog.log("stop: tearing down (isRunning=\(isRunning))")
 
         stopOutputUnit()
+
+        // Output unit first, then the aggregate it pointed at.
+        destroyAggregateIfNeeded()
 
         isolationUnit?.removeTap(onBus: 0)
         engine.stop()
@@ -343,18 +397,76 @@ final class MicProcessor {
 
     // MARK: - Dedicated output unit (consumer)
 
-    private func startOutputUnit(sampleRate: Double) throws {
-        guard let deviceID = outputDeviceID else {
-            throw NSError(domain: "MicProcessor", code: 14,
-                          userInfo: [NSLocalizedDescriptionKey: "No output device selected"])
+    /// Build the private aggregate for this start when both device UIDs
+    /// resolve. Never throws: on any failure we log, destroy what we made,
+    /// and leave aggregateDeviceID nil so startOutputUnit falls back to
+    /// direct BlackHole routing. Any previous aggregate is destroyed first
+    /// so a failed start never leaves a stale device behind.
+    private func setupAggregateDevice() {
+        destroyAggregateIfNeeded()
+        guard let outputID = outputDeviceID else { return }
+
+        // Input leg: the pinned device, or the system default input when
+        // the user never picked one. The engine itself stays unpinned.
+        let inputID: AudioDeviceID
+        if let pinned = inputDeviceID {
+            inputID = pinned
+            FileLog.log("aggregate: input leg is pinned device id \(pinned)")
+        } else {
+            do {
+                inputID = try AudioDeviceManager.defaultInputDeviceID()
+                FileLog.log("aggregate: input leg is system default input id \(inputID)")
+            } catch {
+                FileLog.log("aggregate: skipped, no default input device: \(error.localizedDescription)")
+                return
+            }
         }
 
+        guard let inputUID = AudioDeviceManager.deviceUID(for: inputID) else {
+            FileLog.log("aggregate: skipped, input device UID lookup failed")
+            return
+        }
+        guard let outputUID = AudioDeviceManager.deviceUID(for: outputID) else {
+            FileLog.log("aggregate: skipped, output device UID lookup failed")
+            return
+        }
+        do {
+            let id = try AudioDeviceManager.createAggregateDevice(
+                inputDeviceUID: inputUID, outputDeviceUID: outputUID
+            )
+            // Validate the aggregate's output layout: our stereo client
+            // must map onto the BlackHole member, whose channels begin at
+            // the offset given by the input leg's own output count.
+            let aggregateOutputs = AudioDeviceManager.outputChannelCount(deviceID: id)
+            let offset = UInt32(AudioDeviceManager.outputChannelCount(deviceID: inputID))
+            guard aggregateOutputs >= 2, offset + 2 <= UInt32(aggregateOutputs) else {
+                AudioDeviceManager.destroyAggregateDevice(id: id)
+                FileLog.log("aggregate: unusable channel layout (aggregate outputs \(aggregateOutputs), BlackHole offset \(offset)), falling back to direct routing")
+                return
+            }
+            aggregateDeviceID = id
+            aggregateChannelOffset = offset
+            aggregateChannelCount = UInt32(aggregateOutputs)
+        } catch {
+            FileLog.log("aggregate: creation failed, falling back to direct routing: \(error.localizedDescription)")
+            aggregateDeviceID = nil
+        }
+    }
+
+    /// Build, configure, and start the dedicated HAL output unit against
+    /// one device. Every internal failure path disposes the instance before
+    /// throwing.
+    private func buildOutputUnit(deviceID: AudioDeviceID, sampleRate: Double, channelOffset: UInt32?, deviceChannelCount: UInt32? = nil) throws -> AudioComponentInstance {
         // Match the device's nominal rate to the engine input rate so the
         // ring never needs resampling. Best effort; the stream format then
         // uses the ENGINE/ring rate we actually feed, not the device's
         // read-back rate (a mismatch would make the device consume the ring
-        // at the wrong speed).
-        alignDeviceSampleRate(deviceID, to: sampleRate)
+        // at the wrong speed). Skipped for the aggregate: its nominal rate
+        // follows the clock master, and setting it fails and only pollutes
+        // logs.
+        if channelOffset == nil {
+            alignDeviceSampleRate(deviceID, to: sampleRate)
+        }
         let actualRate = deviceSampleRate(deviceID) ?? sampleRate
         FileLog.log("output: engine rate \(sampleRate), device rate \(actualRate)")
 
@@ -386,6 +498,30 @@ final class MicProcessor {
             AudioComponentInstanceDispose(au)
             throw NSError(domain: "MicProcessor", code: 17,
                           userInfo: [NSLocalizedDescriptionKey: "Output unit rejected the device (code \(status))"])
+        }
+
+        // Aggregate target: map our stereo client onto the BlackHole
+        // member's channels. Per AudioUnitProperties.h the map has one
+        // entry per DESTINATION (device) channel, each holding a SOURCE
+        // (client) channel index, with -1 silencing that destination
+        // channel. BlackHole's channels begin at the offset given by the
+        // input leg's own output count.
+        if let offset = channelOffset, let deviceChannels = deviceChannelCount {
+            var channelMap = [Int32](repeating: -1, count: Int(deviceChannels))
+            channelMap[Int(offset)] = 0
+            channelMap[Int(offset) + 1] = 1
+            let mapSize = UInt32(MemoryLayout<Int32>.size * channelMap.count)
+            status = channelMap.withUnsafeMutableBufferPointer { buffer in
+                AudioUnitSetProperty(au, kAudioOutputUnitProperty_ChannelMap,
+                                      kAudioUnitScope_Output, 0,
+                                      buffer.baseAddress, mapSize)
+            }
+            guard status == noErr else {
+                FileLog.log("output: aggregate channel map rejected (\(status))")
+                AudioComponentInstanceDispose(au)
+                throw NSError(domain: "MicProcessor", code: 22,
+                              userInfo: [NSLocalizedDescriptionKey: "Output unit rejected the aggregate channel map (code \(status))"])
+            }
         }
 
         // 2ch non-interleaved float32: bytes-per-frame/packet describe one
@@ -446,7 +582,35 @@ final class MicProcessor {
                           userInfo: [NSLocalizedDescriptionKey: "Could not start output unit (code \(status))"])
         }
 
-        outputUnit = au
+        return au
+    }
+
+    /// Start the dedicated output unit. Prefers the aggregate (one clock,
+    /// no drift); if the aggregate path fails at ANY step, the aggregate is
+    /// destroyed and the whole unit is rebuilt once against the direct
+    /// output device, exactly as before the drift fix. Only a direct-path
+    /// failure propagates to start().
+    private func startOutputUnit(sampleRate: Double) throws {
+        if let aggregateID = aggregateDeviceID {
+            FileLog.log("output: routing to aggregate id \(aggregateID)")
+            do {
+                outputUnit = try buildOutputUnit(
+                    deviceID: aggregateID, sampleRate: sampleRate,
+                    channelOffset: aggregateChannelOffset,
+                    deviceChannelCount: aggregateChannelCount
+                )
+                return
+            } catch {
+                FileLog.log("aggregate: output unit rejected, falling back to direct routing: \(error.localizedDescription)")
+                aggregateDeviceID = nil
+                AudioDeviceManager.destroyAggregateDevice(id: aggregateID)
+            }
+        }
+        guard let directID = outputDeviceID else {
+            throw NSError(domain: "MicProcessor", code: 14,
+                          userInfo: [NSLocalizedDescriptionKey: "No output device selected"])
+        }
+        outputUnit = try buildOutputUnit(deviceID: directID, sampleRate: sampleRate, channelOffset: nil)
     }
 
     private func stopOutputUnit() {
