@@ -16,13 +16,9 @@ final class HotkeyManager {
 
     // MARK: - Hotkey slots
 
-    /// One registration per physical key combo. Every slot except
-    /// `bypassMomentary` is pressed-only (release events are ignored).
-    /// `bypassMomentary` is the ONLY slot with a release semantic: it fires
-    /// `.bypassOn` while held and `.bypassOff` on release (momentary A/B
-    /// comparison). The handler therefore installs both kEventHotKeyPressed
-    /// and kEventHotKeyReleased; per-slot `releaseAction == nil` keeps the
-    /// pressed-only behavior for all other slots.
+    /// One registration per physical key combo. All slots are pressed-only
+    /// except `bypassMomentary`, the only slot with a release semantic: it
+    /// fires `.bypassOn` while held and `.bypassOff` on release.
     enum Slot: CaseIterable {
         case toggleEngine
         case cycleClarity
@@ -210,8 +206,6 @@ final class HotkeyManager {
 
     private func installEventHandler() {
         // Both pressed AND released: the momentary bypass needs the release.
-        // Slots whose `releaseAction` is nil simply ignore release events, so
-        // they keep their pressed-only behavior.
         var spec = [
             EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
             EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
@@ -249,15 +243,11 @@ final class HotkeyManager {
         return false
     }
 
-    private func unregister(_ slot: Slot) {
-        if let ref = registrations.removeValue(forKey: slot) { UnregisterEventHotKey(ref) }
-    }
-
     // MARK: - Dispatch
 
-    /// Called by the Carbon C shim on the main run loop; routes through
-    /// ActionRouter on the main thread. Presses map via `pressAction`,
-    /// releases only via `releaseAction` (momentary bypass only).
+    /// Called by the Carbon C shim; maps the event to the slot's action and
+    /// hands it to the dispatch closure on the main thread. Releases map
+    /// only via `releaseAction` (momentary bypass only).
     fileprivate func handleHotKeyEvent(numericID: UInt32, pressed: Bool) {
         guard let slot = slot(forNumericID: numericID) else { return }
         let action = pressed ? slot.pressAction : slot.releaseAction

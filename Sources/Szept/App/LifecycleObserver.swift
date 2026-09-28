@@ -24,9 +24,6 @@ enum EngineStartError {
 /// (sleep/wake, USB blips, coreaudiod restarts, BlackHole re-init) recovers
 /// by tearing down and rebuilding against freshly resolved devices instead
 /// of binding to dead devices forever or surfacing a raw OSStatus.
-///
-/// All work here is main-thread lifecycle logic; nothing touches the render
-/// path. The observer lives for the lifetime of the app.
 final class LifecycleObserver {
     private weak var appState: AppState?
 
@@ -113,7 +110,6 @@ final class LifecycleObserver {
         observerTokens.append(token)
     }
 
-    private var deviceListListenerInstalled = false
     // External device UIDs as of the last device-list event, with our own
     // aggregate filtered out. Our own aggregate create/destroy calls fire
     // this same listener; comparing filtered sets keeps them invisible to
@@ -124,8 +120,6 @@ final class LifecycleObserver {
     /// restart). Routed through the same debounced rebuild as the engine
     /// notification so a burst of events causes one rebuild, not many.
     private func observeDeviceList() {
-        guard !deviceListListenerInstalled else { return }
-        deviceListListenerInstalled = true
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -135,9 +129,8 @@ final class LifecycleObserver {
             AudioObjectID(kAudioObjectSystemObject), &address, .main
         ) { [weak self] _, _ in
             guard let self, let appState = self.appState else { return }
-            // Re-enumerate and filter out our own aggregate from BOTH the
-            // snapshot and the current set; update the snapshot on every
-            // event regardless.
+            // Filter our own aggregate from both sets; snapshot updated
+            // every event.
             let current = Set(((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid))
             let filteredCurrent = current.subtracting([AudioDeviceManager.aggregateUID])
             let filteredLast = self.lastExternalDeviceUIDs.subtracting([AudioDeviceManager.aggregateUID])
@@ -175,11 +168,8 @@ final class LifecycleObserver {
 
     // MARK: - Start with retry
 
-    /// Resolve devices, start the engine, and on failure retry once after
-    /// 1.5 seconds following a fresh device re-resolve. The user only sees
-    /// an error when the retry also fails, and the message is a recovery
-    /// hint rather than a raw OSStatus. Every attempt and outcome is
-    /// FileLog'd so post-mortems are possible.
+    /// Re-resolve-only path when the engine should stay idle; otherwise
+    /// delegates to AppState.startEngineWithRetry.
     private func startEngineWithRetry(reason: String, shouldStart: Bool) {
         guard let appState else { return }
         guard shouldStart else {
@@ -191,34 +181,6 @@ final class LifecycleObserver {
             }
             return
         }
-        do {
-            try appState.resolveAndAssignDevices()
-            try appState.micProcessor.start()
-            applyQualityPreset()
-            appState.lastError = nil
-            FileLog.log("\(reason): start succeeded")
-        } catch {
-            FileLog.log("\(reason): start failed: \(error.localizedDescription); retrying once in 1.5s after device re-resolution")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                guard let self, let appState = self.appState else { return }
-                do {
-                    try appState.resolveAndAssignDevices()
-                    try appState.micProcessor.start()
-                    self.applyQualityPreset()
-                    appState.lastError = nil
-                    FileLog.log("\(reason): start succeeded after retry")
-                } catch {
-                    let ns = error as NSError
-                    FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
-                    appState.lastError = EngineStartError.message(for: error)
-                }
-            }
-        }
-    }
-
-    private func applyQualityPreset() {
-        guard let appState else { return }
-        let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
-        appState.micProcessor.applyQualityPreset(preset)
+        appState.startEngineWithRetry(reason: reason)
     }
 }

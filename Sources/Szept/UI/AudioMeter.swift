@@ -1,17 +1,11 @@
 import SwiftUI
 
-struct AudioMeter: View {
+struct AudioMeter: View, Equatable {
     let level: Float
 
-    var body: some View {
-        EquatableView(content: AudioMeterBar(level: level))
-    }
-}
-
-private struct AudioMeterBar: View, Equatable {
-    let level: Float
-
-    static func == (lhs: AudioMeterBar, rhs: AudioMeterBar) -> Bool {
+    // Level hysteresis: ignore sub-0.01 changes so the meter does not
+    // re-render on every sample.
+    static func == (lhs: AudioMeter, rhs: AudioMeter) -> Bool {
         abs(lhs.level - rhs.level) < 0.01
     }
 

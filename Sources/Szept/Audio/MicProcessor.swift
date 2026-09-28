@@ -10,7 +10,6 @@ final class MicProcessor {
 
     var isRunning: Bool = false
     var outputLevel: Float = 0
-    var currentIsolation: Float = 50
     private(set) var isBypassed: Bool = false
     // Pre-bypass state for exact restore; nil while not bypassed.
     private var bypassedIsolation: Float?
@@ -19,9 +18,7 @@ final class MicProcessor {
     // MARK: - Audio thread state (read from callbacks; nonisolated(unsafe))
 
     nonisolated(unsafe) private var tapIsolation: Float = 50
-    // Meter throttle state, owned by the render thread: only send the level
-    // to the main thread when it meaningfully changed, at most every few
-    // buffers, or when it drops back to silence.
+    // Meter throttle state, render-thread-owned.
     nonisolated(unsafe) private var lastSentRMS: Float = 0
     nonisolated(unsafe) private var lastMeterFrame: Int = 0
 
@@ -37,14 +34,10 @@ final class MicProcessor {
     // MARK: - Aggregate device (drift-free output bridge)
 
     // The mic interface and BlackHole run on unsynchronised clocks, so an
-    // SPSC ring bridging them accumulates drift and the user hears periodic
-    // blips. When enabled and both device UIDs resolve, we build a private
-    // aggregate device with the INPUT as clock master and route the OUTPUT
-    // unit at it instead of BlackHole; producer and consumer then share one
-    // crystal and no drift accumulates by construction. The engine stays
-    // exactly as it is (still pinned to the interface directly). Any
-    // aggregate failure falls back to direct BlackHole routing; a start is
-    // never failed because of an aggregate problem.
+    // SPSC ring bridging them drifts and blips. When enabled and both UIDs
+    // resolve, a private aggregate (input as clock master) carries the
+    // output instead; any aggregate failure falls back to direct BlackHole
+    // routing and never fails a start.
     private var aggregateDeviceID: AudioDeviceID?
     // Offset of the BlackHole member's channels within the aggregate's
     // output channel list (the input sub-device's own output count).
@@ -66,10 +59,6 @@ final class MicProcessor {
     var useAggregateDevice: Bool {
         get { UserDefaults.standard.object(forKey: "useAggregateDevice") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "useAggregateDevice") }
-    }
-
-    func setUseAggregate(_ enabled: Bool) {
-        useAggregateDevice = enabled
     }
 
     // MARK: - AVAudioEngine
@@ -131,9 +120,6 @@ final class MicProcessor {
         }
         FileLog.log("start: output device id \(outputDeviceID!)")
 
-        // Drift fix: build the private aggregate (input as clock master)
-        // when enabled and both UIDs resolve; the output unit below will
-        // then target the aggregate instead of BlackHole.
         if useAggregateDevice {
             setupAggregateDevice()
         } else {
@@ -181,8 +167,7 @@ final class MicProcessor {
 
         setIsolationParameter(tapIsolation)
 
-        // Arm the clarity chain with the render rate; the level itself is
-        // picked up by the render thread at the first buffer.
+        // Arm the clarity chain with the render rate.
         voiceChain.configure(sampleRate: Float(inputFormat.sampleRate))
 
         // Reset the ring before the engine starts so the tap (producer)
@@ -192,6 +177,10 @@ final class MicProcessor {
         }
         ringRead = 0
         ringWrite = 0
+        // Render-thread-owned throttle state; reset in the same pre-start
+        // window as the ring so a stale level never survives a restart.
+        lastSentRMS = 0
+        lastMeterFrame = 0
 
         // The tap sits on the isolation unit (pre-mute) so the ring receives
         // the processed signal regardless of where the engine routes its
@@ -252,26 +241,23 @@ final class MicProcessor {
     }
 
     func applyQualityPreset(_ preset: String) {
-        let initialIsolation: Float
+        let isolation: Float
         switch preset {
-        case "light":      initialIsolation = 30
-        case "aggressive": initialIsolation = 80
-        default:           initialIsolation = 50
+        case "light":      isolation = 30
+        case "aggressive": isolation = 80
+        default:           isolation = 50
         }
-        setIsolationLevel(initialIsolation)
+        // During bypass, a strength change updates what is restored on
+        // bypass-off, never the live floor.
+        if isBypassed {
+            bypassedIsolation = isolation
+            return
+        }
+        tapIsolation = isolation
+        setIsolationParameter(isolation)
     }
 
     // MARK: - Parameter control (main thread)
-
-    func setIsolationLevel(_ percent: Float) {
-        let clamped = min(85, max(15, percent))
-        tapIsolation = clamped
-        setIsolationParameter(clamped)
-        currentIsolation = clamped
-        // If the level changes during an A/B bypass, the pending restore must
-        // land on the NEW value, not the stale pre-bypass one.
-        if isBypassed { bypassedIsolation = clamped }
-    }
 
     func setClarity(_ level: ClarityLevel) {
         voiceChain.setClarity(level)
@@ -281,11 +267,8 @@ final class MicProcessor {
 
     // MARK: - A/B bypass (main thread)
 
-    // A/B bypass: momentarily drop isolation to the wet floor (15, the
-    // existing clamp minimum) and suspend the clarity chain, so the user can
-    // compare processed vs raw. The previous isolation and clarity are stored
-    // and restored exactly; the temporary values are never written to
-    // currentIsolation or persisted anywhere.
+    // A/B bypass invariant: the live isolation and clarity are stored on
+    // bypass-on and restored exactly on bypass-off, never persisted.
     func setBypassed(_ bypassed: Bool) {
         guard bypassed != isBypassed else { return }
         if bypassed {
@@ -352,11 +335,9 @@ final class MicProcessor {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
 
-        // Clarity lift runs on the processed signal before it reaches the
-        // ring, followed by a gentle safety limiter; metering reads the
-        // post-chain audio.
+        // Post-chain signal feeds both the ring and the meter.
         voiceChain.process(channelData, count: frameCount)
-        DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 1.0)
+        DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 0.7)
 
         pushToRing(samples: channelData, count: frameCount)
 
@@ -373,7 +354,7 @@ final class MicProcessor {
             lastSentRMS = rms
             lastMeterFrame = 0
             DispatchQueue.main.async { [weak self] in
-                self?.outputLevel = rms
+                if self?.isRunning == true { self?.outputLevel = rms }
             }
         } else {
             lastMeterFrame = framesSinceSend + 1
@@ -382,9 +363,9 @@ final class MicProcessor {
 
     private nonisolated func pushToRing(samples: UnsafePointer<Float>, count: Int) {
         guard let ring else { return }
+        let readIndex = ringRead
         // Acquire: observe the samples before trusting the read index.
         OSMemoryBarrier()
-        let readIndex = ringRead
         let available = (ringCapacity + readIndex - ringWrite - 1 + ringCapacity) % ringCapacity
         let n = min(count, available)
         for i in 0..<n {
@@ -400,8 +381,7 @@ final class MicProcessor {
     /// Build the private aggregate for this start when both device UIDs
     /// resolve. Never throws: on any failure we log, destroy what we made,
     /// and leave aggregateDeviceID nil so startOutputUnit falls back to
-    /// direct BlackHole routing. Any previous aggregate is destroyed first
-    /// so a failed start never leaves a stale device behind.
+    /// direct BlackHole routing.
     private func setupAggregateDevice() {
         destroyAggregateIfNeeded()
         guard let outputID = outputDeviceID else { return }
@@ -588,8 +568,7 @@ final class MicProcessor {
     /// Start the dedicated output unit. Prefers the aggregate (one clock,
     /// no drift); if the aggregate path fails at ANY step, the aggregate is
     /// destroyed and the whole unit is rebuilt once against the direct
-    /// output device, exactly as before the drift fix. Only a direct-path
-    /// failure propagates to start().
+    /// output device. Only a direct-path failure propagates to start().
     private func startOutputUnit(sampleRate: Double) throws {
         if let aggregateID = aggregateDeviceID {
             FileLog.log("output: routing to aggregate id \(aggregateID)")
@@ -681,6 +660,7 @@ final class MicProcessor {
                 }
             }
         }
+        OSMemoryBarrier()
         ringRead = (ringRead + n) % ringCapacity
     }
 }

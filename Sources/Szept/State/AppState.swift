@@ -67,4 +67,42 @@ final class AppState {
                           userInfo: [NSLocalizedDescriptionKey: "No output device found. Install BlackHole (existential.audio/blackhole) or pick a device in Settings."])
         }
     }
+
+    // MARK: - Start with retry
+
+    /// Resolve devices, start the engine, and on failure retry once after
+    /// 1.5 seconds following a fresh device re-resolve. The user only sees
+    /// an error when the retry also fails, and the message is a recovery
+    /// hint rather than a raw OSStatus. Every attempt and outcome is
+    /// FileLog'd so post-mortems are possible.
+    func startEngineWithRetry(reason: String) {
+        do {
+            try resolveAndAssignDevices()
+            try micProcessor.start()
+            let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
+            micProcessor.applyQualityPreset(preset)
+            lastError = nil
+            // Preference is never written false on failure, so a transient failure cannot disable an enabled auto-start; one attempt plus one retry, no loop.
+            UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
+            FileLog.log("\(reason): start succeeded")
+        } catch {
+            FileLog.log("\(reason): start failed: \(error.localizedDescription); retrying once in 1.5s after device re-resolution")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.resolveAndAssignDevices()
+                    try self.micProcessor.start()
+                    let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
+                    self.micProcessor.applyQualityPreset(preset)
+                    self.lastError = nil
+                    UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
+                    FileLog.log("\(reason): start succeeded after retry")
+                } catch {
+                    let ns = error as NSError
+                    FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
+                    self.lastError = EngineStartError.message(for: error)
+                }
+            }
+        }
+    }
 }

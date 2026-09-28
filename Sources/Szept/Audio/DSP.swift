@@ -2,15 +2,23 @@ import Accelerate
 import Foundation
 
 enum DSP {
-    /// Apply tanh soft limiting in-place. Threshold controls the knee point.
+    /// Soft-knee limiter: exact identity below the threshold, a smooth
+    /// tanh transition above it approaching unity (full scale). The curve
+    /// is continuous with unit slope at the knee, so nominal-level audio
+    /// passes untouched and only peaks are tucked in.
     static func applySoftLimiter(
         samples: UnsafeMutablePointer<Float>,
         count: Int,
         threshold: Float
     ) {
-        let invThreshold = 1.0 / threshold
+        let kneeSpan = 1.0 - threshold
+        guard kneeSpan > 0 else { return }
         for i in 0..<count {
-            samples[i] = threshold * tanh(samples[i] * invThreshold)
+            let x = samples[i]
+            let magnitude = abs(x)
+            guard magnitude > threshold else { continue }
+            let shaped = threshold + kneeSpan * tanh((magnitude - threshold) / kneeSpan)
+            samples[i] = x < 0 ? -shaped : shaped
         }
     }
 
@@ -22,10 +30,5 @@ enum DSP {
         var result: Float = 0
         vDSP_rmsqv(samples, 1, &result, vDSP_Length(count))
         return result
-    }
-
-    /// Convert dB value to linear gain multiplier.
-    static func dbToLinear(_ db: Float) -> Float {
-        return pow(10.0, db / 20.0)
     }
 }

@@ -111,7 +111,6 @@ private struct GeneralTab: View {
 
 private struct AudioTab: View {
     @Environment(AppState.self) private var appState
-    @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
     @AppStorage("inputDeviceUID") private var inputDeviceUID: String = ""
     @AppStorage("outputDeviceUID") private var outputDeviceUID: String = ""
     @AppStorage("useAggregateDevice") private var useAggregateDevice: Bool = true
@@ -145,9 +144,6 @@ private struct AudioTab: View {
                         .foregroundStyle(.orange)
                 }
                 Toggle("Drift-free output (aggregate device)", isOn: $useAggregateDevice)
-                    .onChange(of: useAggregateDevice) { _, enabled in
-                        appState.micProcessor.setUseAggregate(enabled)
-                    }
                 Text("Bridges the input and BlackHole on one clock. Takes effect on the next start. Turn off if output stops working.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -169,18 +165,6 @@ private struct AudioTab: View {
                 Text("Adds a gentle presence lift with a matching de-esser for a clearer, more broadcast-like voice.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            Section("Isolation") {
-                LabeledContent("Strength") {
-                    Picker("Strength", selection: $qualityPreset) {
-                        Text("Gentle").tag("light")
-                        Text("Medium").tag("balanced")
-                        Text("Max").tag("aggressive")
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
-                }
             }
         }
         .formStyle(.grouped)

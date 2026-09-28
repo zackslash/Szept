@@ -149,43 +149,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Delay slightly to ensure audio system is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
-            do {
-                try self.appState.resolveAndAssignDevices()
-                try self.appState.micProcessor.start()
-                let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
-                self.appState.micProcessor.applyQualityPreset(preset)
-                FileLog.log("autoStart: succeeded")
-            } catch {
-                // A stale device (unplugged mic, vanished BlackHole) is the
-                // overwhelmingly likely cause; re-resolve and retry ONCE.
-                FileLog.log("autoStart: failed: \(error.localizedDescription); retrying after device re-resolution")
-                self.startWithDeviceRetry()
-            }
-        }
-    }
-
-    /// Second (and final) start attempt for the auto-start path. Runs 1.5s
-    /// after the first failure so the HAL has time to settle a mid-
-    /// reconfiguration device (for example -10875) before we re-resolve.
-    private func startWithDeviceRetry() {
-        FileLog.log("autoStart: retrying in 1.5s after device re-resolution")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self else { return }
-            do {
-                try self.appState.resolveAndAssignDevices()
-                try self.appState.micProcessor.start()
-                let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
-                self.appState.micProcessor.applyQualityPreset(preset)
-                FileLog.log("autoStart: succeeded after device re-resolution")
-            } catch {
-                let ns = error as NSError
-                FileLog.log("autoStart: failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
-                self.appState.lastError = EngineStartError.message(for: error)
-                // Auto-start stays enabled: a transient failure must not
-                // leave the app silently off at the next launch. Each
-                // launch makes one attempt plus one retry, so there is no
-                // retry loop to guard against.
-            }
+            self.appState.startEngineWithRetry(reason: "autoStart")
         }
     }
 

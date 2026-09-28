@@ -8,22 +8,31 @@ final class DSPTests: XCTestCase {
     func testSoftLimiterClampsLargeValues() {
         var samples: [Float] = [10.0, -10.0]
         DSP.applySoftLimiter(samples: &samples, count: samples.count, threshold: 0.7)
-        XCTAssertTrue(samples[0] < 0.71 && samples[0] > 0.69)
-        XCTAssertTrue(samples[1] > -0.71 && samples[1] < -0.69)
+        XCTAssertGreaterThan(samples[0], 0.99)
+        XCTAssertLessThan(samples[0], 1.0)
+        XCTAssertLessThan(samples[1], -0.99)
+        XCTAssertGreaterThan(samples[1], -1.0)
     }
 
-    func testSoftLimiterPreservesSmallValues() {
+    func testSoftLimiterPreservesSmallValuesExactly() {
         var samples: [Float] = [0.01, -0.01]
         DSP.applySoftLimiter(samples: &samples, count: samples.count, threshold: 0.7)
-        XCTAssertLessThan(abs(samples[0] - 0.01), 0.001)
-        XCTAssertLessThan(abs(samples[1] - (-0.01)), 0.001)
+        XCTAssertEqual(samples[0], 0.01)
+        XCTAssertEqual(samples[1], -0.01)
     }
 
-    func testSoftLimiterOutputNeverExceedsThreshold() {
+    func testSoftLimiterIsExactBelowKnee() {
+        var samples: [Float] = [0.7, 0.69, 0.5, 0.0, -0.5, -0.69, -0.7]
+        DSP.applySoftLimiter(samples: &samples, count: samples.count, threshold: 0.7)
+        XCTAssertEqual(samples, [0.7, 0.69, 0.5, 0.0, -0.5, -0.69, -0.7])
+    }
+
+    func testSoftLimiterOutputNeverExceedsUnity() {
         var samples: [Float] = [1.0, 2.0, 5.0, -1.0, -2.0, -5.0]
         DSP.applySoftLimiter(samples: &samples, count: samples.count, threshold: 0.7)
         for s in samples {
-            XCTAssertLessThanOrEqual(abs(s), 0.7 + 0.001)
+            XCTAssertLessThanOrEqual(abs(s), 1.0)
+            XCTAssertGreaterThan(abs(s), 0.7)
         }
     }
 
@@ -48,20 +57,6 @@ final class DSPTests: XCTestCase {
         }
         let result = DSP.calculateRMS(samples: samples, count: count)
         XCTAssertLessThan(abs(result - 0.707), 0.01)
-    }
-
-    // MARK: - dbToLinear
-
-    func testZeroDBIsUnityGain() {
-        XCTAssertLessThan(abs(DSP.dbToLinear(0) - 1.0), 0.0001)
-    }
-
-    func testSixDBIsApproximatelyDouble() {
-        XCTAssertLessThan(abs(DSP.dbToLinear(6) - 2.0), 0.01)
-    }
-
-    func testNegativeSixDBIsApproximatelyHalf() {
-        XCTAssertLessThan(abs(DSP.dbToLinear(-6) - 0.5), 0.01)
     }
 }
 

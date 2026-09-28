@@ -1,7 +1,7 @@
 import Foundation
 import CoreAudio
 
-struct AudioDeviceInfo: Identifiable, Hashable {
+struct AudioDeviceInfo: Identifiable {
     let id: AudioDeviceID
     let uid: String
     let name: String
@@ -61,7 +61,9 @@ final class AudioDeviceManager {
         var devices: [AudioDeviceInfo] = []
         devices.reserveCapacity(deviceIDs.count)
         for deviceID in deviceIDs {
-            if let info = try deviceInfo(for: deviceID) {
+            // A dead device (unreadable properties) is skipped, not fatal:
+            // one poisoned entry must not break the whole enumeration.
+            if let info = try? deviceInfo(for: deviceID) {
                 devices.append(info)
             }
         }
@@ -182,12 +184,10 @@ final class AudioDeviceManager {
         (try? stringProperty(selector: kAudioDevicePropertyDeviceUID, deviceID: deviceID)) ?? nil
     }
 
-    /// Output channel count of a device on the output scope.
     static func outputChannelCount(deviceID: AudioDeviceID) -> Int {
         (try? channelCount(deviceID: deviceID, scope: kAudioObjectPropertyScopeOutput)) ?? 0
     }
 
-    /// The system default input device (kAudioHardwarePropertyDefaultInputDevice).
     static func defaultInputDeviceID() throws -> AudioDeviceID {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
@@ -207,11 +207,8 @@ final class AudioDeviceManager {
         return deviceID
     }
 
-    /// Create the private aggregate that bridges the input device (clock
-    /// master) and the loopback output device onto one clock, so the engine
-    /// tap (producer) and our output render (consumer) share one crystal
-    /// and no drift accumulates in the ring. Any stale aggregate from a
-    /// previous session is destroyed first.
+    /// Create the private aggregate bridging input (clock master) and
+    /// loopback output onto one clock, destroying any stale aggregate first.
     static func createAggregateDevice(inputDeviceUID: String, outputDeviceUID: String) throws -> AudioDeviceID {
         findAndDestroyStaleAggregate()
 
@@ -254,9 +251,8 @@ final class AudioDeviceManager {
         }
     }
 
-    /// Find and destroy any aggregate carrying our stable UID (for example
-    /// left behind by a crash). Reuses the existing enumeration and CFString
-    /// property helpers.
+    /// Destroy any aggregate carrying our stable UID, for example one left
+    /// behind by a crash.
     private static func findAndDestroyStaleAggregate() {
         guard let devices = try? allDevices() else { return }
         for device in devices where device.uid == aggregateUID {

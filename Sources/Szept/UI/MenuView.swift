@@ -41,7 +41,7 @@ struct MenuView: View {
             Text("Output level")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            AudioMeter(level: appState.micProcessor.outputLevel)
+            AudioMeter(level: appState.micProcessor.outputLevel).equatable()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

@@ -20,8 +20,7 @@ enum ClarityLevel: String, CaseIterable {
         }
     }
 
-    /// Presence (peaking-bell) lift in dB. Conservative by design: a gentle,
-    /// wide lift adds clarity without coloring the voice.
+    /// Presence (peaking-bell) lift in dB. Conservative by design.
     var presenceDb: Float {
         switch self {
         case .off:    return 0
