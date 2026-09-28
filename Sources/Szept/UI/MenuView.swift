@@ -31,10 +31,6 @@ struct MenuView: View {
                     appState.lastError = nil
                 }
             }
-            if appState.shouldShowAppWarning,
-               let reason = appState.frontmostAppMonitor.incompatibilityReason {
-                AppWarningBanner(reason: reason)
-            }
         }
         .padding(.horizontal, 12)
         .padding(.top, 4)

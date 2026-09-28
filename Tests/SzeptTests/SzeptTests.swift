@@ -63,48 +63,6 @@ final class DSPTests: XCTestCase {
     func testNegativeSixDBIsApproximatelyHalf() {
         XCTAssertLessThan(abs(DSP.dbToLinear(-6) - 0.5), 0.01)
     }
-
-    // MARK: - BundleIdentifiers Tests
-
-    func testChromiumBrowsersDetected() {
-        let known = [
-            "com.google.Chrome",
-            "com.microsoft.edgemac",
-            "com.brave.Browser",
-            "company.thebrowser.Browser",
-            "com.operasoftware.Opera",
-            "com.vivaldi.Vivaldi"
-        ]
-        for id in known {
-            XCTAssertTrue(BundleIdentifiers.isChromiumBrowser(id), "\(id) should be Chromium")
-        }
-    }
-
-    func testElectronAppsDetected() {
-        let known = [
-            "com.tinyspeck.slackmacgap",
-            "com.hnc.Discord",
-            "com.microsoft.teams2"
-        ]
-        for id in known {
-            XCTAssertTrue(BundleIdentifiers.isElectronApp(id), "\(id) should be Electron")
-        }
-    }
-
-    func testUnknownBundleIDsReturnFalse() {
-        XCTAssertFalse(BundleIdentifiers.isChromiumBrowser("com.apple.safari"))
-        XCTAssertFalse(BundleIdentifiers.isElectronApp("com.apple.mail"))
-        XCTAssertFalse(BundleIdentifiers.isChromiumBrowser(""))
-    }
-
-    func testVoiceIsolationIncompatibleCoversAll() {
-        for id in BundleIdentifiers.chromiumBrowsers {
-            XCTAssertTrue(BundleIdentifiers.isVoiceIsolationIncompatible(id))
-        }
-        for id in BundleIdentifiers.electronApps {
-            XCTAssertTrue(BundleIdentifiers.isVoiceIsolationIncompatible(id))
-        }
-    }
 }
 
 final class ActionRouterURLTests: XCTestCase {

@@ -11,7 +11,6 @@ enum SzeptMode: String {
 final class AppState {
     let micProcessor = MicProcessor()
     let micModeMonitor = MicModeMonitor()
-    let frontmostAppMonitor = FrontmostAppMonitor()
     var micPermissionDenied: Bool = false
     var lastError: String?
 
@@ -19,10 +18,6 @@ final class AppState {
         guard micProcessor.isRunning else { return .off }
         if micModeMonitor.isVoiceIsolationActive { return .enhanced }
         return .standalone
-    }
-
-    var shouldShowAppWarning: Bool {
-        micProcessor.isRunning && !frontmostAppMonitor.isVoiceIsolationCompatible
     }
 
     var statusDescription: String {
