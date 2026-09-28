@@ -39,7 +39,7 @@ final class FrontmostAppMonitor {
 
         if BundleIdentifiers.isVoiceIsolationIncompatible(bundleID) {
             isVoiceIsolationCompatible = false
-            incompatibilityReason = "Voice Isolation doesn't work in \(app?.localizedName ?? "this app"). Szept is handling it alone."
+            incompatibilityReason = "System Voice Isolation does not apply to \(app?.localizedName ?? "this app"). Szept's isolation is the only active layer."
         } else {
             isVoiceIsolationCompatible = true
             incompatibilityReason = nil
