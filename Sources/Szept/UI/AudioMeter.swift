@@ -22,11 +22,22 @@ private struct AudioMeterBar: View, Equatable {
                     .fill(.fill.tertiary)
                 RoundedRectangle(cornerRadius: 4)
                     .fill(meterGradient)
-                    .frame(width: geometry.size.width * CGFloat(min(level, 1.0)))
+                    .frame(width: geometry.size.width * CGFloat(displayPosition))
                     .animation(.easeOut(duration: 0.1), value: level)
             }
         }
         .frame(height: 8)
+    }
+
+    // Display-only remap: position the bar on a decibel scale instead of
+    // linear RMS. The audio signal itself is untouched. Linear mapping made
+    // normal speech (RMS roughly 0.02 to 0.08) a barely visible sliver.
+    // floorDB/ceilingDB clamp the useful range at -60 to 0 dBFS.
+    private var displayPosition: Float {
+        let floorDB: Float = -60
+        let ceilingDB: Float = 0
+        let db = 20 * log10(max(level, 0.00001))
+        return min(max((db - floorDB) / (ceilingDB - floorDB), 0), 1)
     }
 
     private var meterGradient: LinearGradient {
