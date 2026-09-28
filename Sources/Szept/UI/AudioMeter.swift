@@ -17,7 +17,7 @@ struct AudioMeter: View, Equatable {
                 RoundedRectangle(cornerRadius: 4)
                     .fill(meterGradient)
                     .frame(width: geometry.size.width * CGFloat(displayPosition))
-                    .animation(.easeOut(duration: 0.1), value: level)
+                    .animation(.easeOut(duration: 0.05), value: level)
             }
         }
         .frame(height: 8)

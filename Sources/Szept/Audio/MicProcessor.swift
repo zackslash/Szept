@@ -18,9 +18,11 @@ final class MicProcessor {
     // MARK: - Audio thread state (read from callbacks; nonisolated(unsafe))
 
     nonisolated(unsafe) private var tapIsolation: Float = 50
-    // Meter throttle state, render-thread-owned.
-    nonisolated(unsafe) private var lastSentRMS: Float = 0
-    nonisolated(unsafe) private var lastMeterFrame: Int = 0
+    // Latest output RMS. Written only by the render thread, polled by the
+    // main-thread meter timer: one word-sized store/load needs no lock and
+    // the render thread never dispatches or allocates.
+    nonisolated(unsafe) private var meterLevel: Float = 0
+    private var meterTimer: Timer?
 
     // MARK: - Clarity ("Broadcast Voice")
 
@@ -177,11 +179,6 @@ final class MicProcessor {
         }
         ringRead = 0
         ringWrite = 0
-        // Render-thread-owned throttle state; reset in the same pre-start
-        // window as the ring so a stale level never survives a restart.
-        lastSentRMS = 0
-        lastMeterFrame = 0
-
         // The tap sits on the isolation unit (pre-mute) so the ring receives
         // the processed signal regardless of where the engine routes its
         // (silent) output.
@@ -210,6 +207,7 @@ final class MicProcessor {
             throw error
         }
         FileLog.log("start: complete, output unit running")
+        startMeterTimer()
 
         isRunning = true
         logger.notice("MicProcessor started; engine muted, dedicated output unit running")
@@ -236,8 +234,24 @@ final class MicProcessor {
         }
 
         isRunning = false
+        stopMeterTimer()
         outputLevel = 0
         logger.notice("MicProcessor stopped")
+    }
+
+    // MARK: - Metering
+
+    private func startMeterTimer() {
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self, self.isRunning else { return }
+            let level = self.meterLevel
+            if level != self.outputLevel { self.outputLevel = level }
+        }
+    }
+
+    private func stopMeterTimer() {
+        meterTimer?.invalidate()
+        meterTimer = nil
     }
 
     func applyQualityPreset(_ preset: String) {
@@ -343,22 +357,7 @@ final class MicProcessor {
 
         let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
 
-        // Rate-limit main-thread meter updates: send on a meaningful change,
-        // at least every few buffers so the meter keeps moving, and promptly
-        // on a drop back to silence. Both scalars are render-thread-owned.
-        let framesSinceSend = lastMeterFrame
-        let shouldSend = abs(rms - lastSentRMS) > 0.02
-            || framesSinceSend >= 4
-            || (rms < 0.001 && lastSentRMS >= 0.001)
-        if shouldSend {
-            lastSentRMS = rms
-            lastMeterFrame = 0
-            DispatchQueue.main.async { [weak self] in
-                if self?.isRunning == true { self?.outputLevel = rms }
-            }
-        } else {
-            lastMeterFrame = framesSinceSend + 1
-        }
+        meterLevel = rms
     }
 
     private nonisolated func pushToRing(samples: UnsafePointer<Float>, count: Int) {
