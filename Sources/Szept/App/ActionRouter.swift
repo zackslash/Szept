@@ -90,7 +90,10 @@ enum AppAction: CaseIterable {
                 let retryNs = error as NSError
                 FileLog.log("engine: start failed after retry: \(error.localizedDescription) (domain \(retryNs.domain), code \(retryNs.code))")
                 appState.lastError = EngineStartError.message(for: error)
-                preference.set(false, forKey: "isProcessingEnabled")
+                // Auto-start stays enabled: a transient failure must not
+                // leave the app silently off at the next launch. Each
+                // launch makes one attempt plus one retry, so there is no
+                // retry loop to guard against.
             }
         }
     }

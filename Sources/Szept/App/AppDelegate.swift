@@ -181,8 +181,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let ns = error as NSError
                 FileLog.log("autoStart: failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
                 self.appState.lastError = EngineStartError.message(for: error)
-                // Reset the preference so it doesn't keep trying and failing
-                UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
+                // Auto-start stays enabled: a transient failure must not
+                // leave the app silently off at the next launch. Each
+                // launch makes one attempt plus one retry, so there is no
+                // retry loop to guard against.
             }
         }
     }
