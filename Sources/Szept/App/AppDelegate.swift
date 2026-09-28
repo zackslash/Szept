@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
     private var statusItem: NSStatusItem!
     private var hotkeyManager: HotkeyManager?
+    private var lifecycleObserver: LifecycleObserver?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FileLog.log("app: didFinishLaunching")
@@ -27,6 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupHotkeys()
         observeMode()
+        lifecycleObserver = LifecycleObserver(appState: appState)
         checkMicPermission()
     }
 
@@ -162,18 +164,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Second (and final) start attempt for the auto-start path. Runs 1.5s
+    /// after the first failure so the HAL has time to settle a mid-
+    /// reconfiguration device (for example -10875) before we re-resolve.
     private func startWithDeviceRetry() {
-        do {
-            try appState.resolveAndAssignDevices()
-            try appState.micProcessor.start()
-            let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
-            appState.micProcessor.applyQualityPreset(preset)
-            FileLog.log("autoStart: succeeded after device re-resolution")
-        } catch {
-            FileLog.log("autoStart: failed after retry: \(error.localizedDescription)")
-            appState.lastError = error.localizedDescription
-            // Reset the preference so it doesn't keep trying and failing
-            UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
+        FileLog.log("autoStart: retrying in 1.5s after device re-resolution")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            do {
+                try self.appState.resolveAndAssignDevices()
+                try self.appState.micProcessor.start()
+                let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
+                self.appState.micProcessor.applyQualityPreset(preset)
+                FileLog.log("autoStart: succeeded after device re-resolution")
+            } catch {
+                let ns = error as NSError
+                FileLog.log("autoStart: failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
+                self.appState.lastError = EngineStartError.message(for: error)
+                // Reset the preference so it doesn't keep trying and failing
+                UserDefaults.standard.set(false, forKey: "isProcessingEnabled")
+            }
         }
     }
 

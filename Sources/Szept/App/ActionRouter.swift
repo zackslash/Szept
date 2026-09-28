@@ -68,22 +68,30 @@ enum AppAction: CaseIterable {
             } catch {
                 // A stale device (unplugged mic, vanished BlackHole) is the
                 // overwhelmingly likely cause; re-resolve and retry ONCE.
-                startWithDeviceRetry(on: appState, preference: defaults)
+                startWithDeviceRetry(on: appState, preference: defaults, firstError: error)
             }
         }
     }
 
-    private func startWithDeviceRetry(on appState: AppState, preference: UserDefaults) {
-        do {
-            try appState.resolveAndAssignDevices()
-            try appState.micProcessor.start()
-            appState.lastError = nil
-            preference.set(true, forKey: "isProcessingEnabled")
-            FileLog.log("engine: start succeeded after device re-resolution")
-        } catch {
-            FileLog.log("engine: start failed after retry: \(error.localizedDescription)")
-            appState.lastError = "Failed to start: \(error.localizedDescription)"
-            preference.set(false, forKey: "isProcessingEnabled")
+    /// Second (and final) start attempt for manual toggles. Runs 1.5s after
+    /// the first failure so the HAL has time to settle a mid-reconfiguration
+    /// device (for example -10875) before we re-resolve.
+    private func startWithDeviceRetry(on appState: AppState, preference: UserDefaults, firstError: Error) {
+        let ns = firstError as NSError
+        FileLog.log("engine: start failed: \(firstError.localizedDescription) (domain \(ns.domain), code \(ns.code)); retrying once in 1.5s after device re-resolution")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            do {
+                try appState.resolveAndAssignDevices()
+                try appState.micProcessor.start()
+                appState.lastError = nil
+                preference.set(true, forKey: "isProcessingEnabled")
+                FileLog.log("engine: start succeeded after device re-resolution")
+            } catch {
+                let retryNs = error as NSError
+                FileLog.log("engine: start failed after retry: \(error.localizedDescription) (domain \(retryNs.domain), code \(retryNs.code))")
+                appState.lastError = EngineStartError.message(for: error)
+                preference.set(false, forKey: "isProcessingEnabled")
+            }
         }
     }
 
