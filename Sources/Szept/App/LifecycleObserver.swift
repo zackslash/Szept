@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import AVFoundation
-import AudioToolbox
 import CoreAudio
 
 /// Maps a failed engine start to a user-facing message. Raw OSStatus codes
@@ -28,7 +27,6 @@ final class LifecycleObserver {
     private weak var appState: AppState?
 
     private var wasRunningBeforeSleep = false
-    private var isRebuilding = false
     private var pendingRebuild: DispatchWorkItem?
     private var observerTokens: [NSObjectProtocol] = []
 
@@ -133,9 +131,11 @@ final class LifecycleObserver {
             // every event.
             let current = Set(((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid))
             let filteredCurrent = current.subtracting([AudioDeviceManager.aggregateUID])
-            let filteredLast = self.lastExternalDeviceUIDs.subtracting([AudioDeviceManager.aggregateUID])
+            // Compare before the snapshot is refreshed: the stored set is
+            // already filtered, no need to filter it again here.
+            let changed = filteredCurrent != self.lastExternalDeviceUIDs
             self.lastExternalDeviceUIDs = filteredCurrent
-            guard appState.micProcessor.isRunning, filteredCurrent != filteredLast else { return }
+            guard appState.micProcessor.isRunning, changed else { return }
             self.scheduleRebuild(reason: "system device list changed")
         }
     }
@@ -152,31 +152,11 @@ final class LifecycleObserver {
 
     private func rebuild(reason: String) {
         guard let appState else { return }
-        guard !isRebuilding else {
-            FileLog.log("device: rebuild suppressed, one already in progress (\(reason))")
-            return
-        }
-        isRebuilding = true
-        defer { isRebuilding = false }
-
         let wasRunning = appState.micProcessor.isRunning
         FileLog.log("device: rebuild begin (\(reason)), wasRunning=\(wasRunning)")
-        if wasRunning {
-            appState.micProcessor.stop()
-            appState.invalidatePendingStarts()
-        }
-        let startReason = "rebuild (\(reason))"
-        if !wasRunning {
-            // Always re-resolve so a later manual Start also sees fresh
-            // devices, even when the engine stays idle.
-            do {
-                try appState.resolveAndAssignDevices()
-                FileLog.log("\(startReason): devices re-resolved (engine idle)")
-            } catch {
-                FileLog.log("\(startReason): device re-resolution failed: \(error.localizedDescription)")
-            }
-            return
-        }
-        appState.startEngineWithRetry(reason: startReason)
+        guard wasRunning else { return }
+        appState.micProcessor.stop()
+        appState.invalidatePendingStarts()
+        appState.startEngineWithRetry(reason: "rebuild (\(reason))")
     }
 }

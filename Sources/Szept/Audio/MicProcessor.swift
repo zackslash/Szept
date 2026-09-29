@@ -22,12 +22,15 @@ final class MicProcessor {
     // main-thread meter timer: one word-sized store/load needs no lock and
     // the render thread never dispatches or allocates.
     nonisolated(unsafe) private var meterLevel: Float = 0
+
+    // MARK: - Meter and process-activity state (main thread only)
+
     private var meterTimer: Timer?
     // Process activity token held while the engine runs (App Nap guard).
     private var activity: NSObjectProtocol?
     // Display-side staleness tracking: when the capture stream stalls the
     // render-side value stops changing and the bar would freeze at the
-    // last speech level. Main-thread only.
+    // last speech level.
     private var lastRTLevel: Float = -1
     private var meterStaleTicks = 0
 
@@ -263,24 +266,24 @@ final class MicProcessor {
     private func startMeterTimer() {
         // Clear any pre-stop value so a restart cannot flash it for one tick.
         meterLevel = 0
+        lastRTLevel = -1
+        meterStaleTicks = 0
         // .common so the timer keeps firing while an NSMenu is tracking:
         // the meter lives inside the open menu popup, where default-mode
         // timers are suspended.
-        lastRTLevel = -1
-        meterStaleTicks = 0
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self, self.isRunning else { return }
             let level = self.meterLevel
             if level != self.lastRTLevel {
                 // Fresh data: track it directly (instant attack). Write
-                // outputLevel only past a small display hysteresis
+                // outputLevel only beyond a small display hysteresis
                 // (the view's own is 0.01).
                 self.lastRTLevel = level
                 self.meterStaleTicks = 0
                 if abs(level - self.outputLevel) > 0.005 { self.outputLevel = level }
             } else {
                 self.meterStaleTicks += 1
-                // Periodic probe: a live stream that repeats bit-identical values recovers.
+                // Periodic probe (1s): a live stream that repeats bit-identical values recovers.
                 if self.meterStaleTicks % 60 == 0 { self.lastRTLevel = -1 }
                 // ~300ms with no new value reads as a stalled stream:
                 // decay the bar toward zero instead of freezing it.

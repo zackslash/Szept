@@ -14,10 +14,10 @@ final class AppState {
     var micPermissionDenied: Bool = false
     var lastError: String?
 
-    // Bumped on every start attempt and every user stop; a pending retry
-    // carries the generation it was scheduled under and aborts if it no
-    // longer matches.
-    private(set) var startGeneration = 0
+    // Bumped on every start attempt and every stop (user or rebuild); a
+    // pending retry carries the generation it was scheduled under and
+    // aborts if it no longer matches.
+    private var startGeneration = 0
 
     /// Invalidates any pending start retry (call from every user-stop path).
     func invalidatePendingStarts() {
@@ -89,28 +89,15 @@ final class AppState {
         startGeneration += 1
         let generation = startGeneration
 
-        func attempt(_ tag: String) throws {
-            try resolveAndAssignDevices()
-            try micProcessor.start()
-            let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
-            micProcessor.applyQualityPreset(preset)
-            lastError = nil
-            // Preference is never written false on failure: a transient
-            // failure must not disable an enabled auto-start. One attempt
-            // plus one retry; no loop to guard against.
-            UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
-            FileLog.log("\(reason): \(tag)")
-        }
-
         do {
-            try attempt("start succeeded")
+            try attempt("start succeeded", reason: reason)
         } catch {
             FileLog.log("\(reason): start failed: \(error.localizedDescription); retrying once in 1.5s after device re-resolution")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
                 guard generation == self.startGeneration else { return }
                 do {
-                    try attempt("start succeeded after retry")
+                    try self.attempt("start succeeded after retry", reason: reason)
                 } catch {
                     let ns = error as NSError
                     FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
@@ -118,5 +105,20 @@ final class AppState {
                 }
             }
         }
+    }
+
+    /// One start attempt: resolve, start, apply preset, clear error,
+    /// record success. Throws on failure; callers own retry policy.
+    private func attempt(_ tag: String, reason: String) throws {
+        try resolveAndAssignDevices()
+        try micProcessor.start()
+        let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
+        micProcessor.applyQualityPreset(preset)
+        lastError = nil
+        // Preference is never written false on failure: a transient
+        // failure must not disable an enabled auto-start. One attempt
+        // plus one retry; no loop to guard against.
+        UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
+        FileLog.log("\(reason): \(tag)")
     }
 }

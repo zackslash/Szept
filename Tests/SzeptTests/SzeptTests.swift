@@ -1,5 +1,4 @@
 import XCTest
-import Accelerate
 @testable import Szept
 
 final class DSPTests: XCTestCase {

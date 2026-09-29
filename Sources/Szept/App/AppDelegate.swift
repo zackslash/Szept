@@ -100,7 +100,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func registerDefaults() {
         UserDefaults.standard.register(defaults: [
-            "launchAtLogin": false,
             "isProcessingEnabled": true,
             "qualityPreset": "aggressive",
             "clarityLevel": "off"

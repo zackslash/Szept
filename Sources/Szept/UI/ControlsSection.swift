@@ -5,7 +5,7 @@ struct ControlsSection: View {
     @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
 
     var body: some View {
-        @Bindable var processor = appState.micProcessor
+        let processor = appState.micProcessor
         VStack(alignment: .leading, spacing: 10) {
             qualityRow(processor: processor)
         }
