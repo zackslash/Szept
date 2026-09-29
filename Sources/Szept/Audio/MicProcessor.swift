@@ -23,6 +23,8 @@ final class MicProcessor {
     // the render thread never dispatches or allocates.
     nonisolated(unsafe) private var meterLevel: Float = 0
     private var meterTimer: Timer?
+    // Process activity token held while the engine runs (App Nap guard).
+    private var activity: NSObjectProtocol?
     // Display-side staleness tracking: when the capture stream stalls the
     // render-side value stops changing, and the bar would freeze at the
     // last speech level. These drive a decay instead. Main-thread only.
@@ -215,6 +217,14 @@ final class MicProcessor {
         startMeterTimer()
 
         isRunning = true
+        // Keep macOS from napping the app while audio flows: App Nap
+        // throttles main-thread timers, which would show up as growing
+        // meter lag over long sessions. System idle sleep stays allowed;
+        // the wake handler rebuilds the engine after real sleep.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "Szept audio pipeline active"
+        )
         logger.notice("MicProcessor started; engine muted, dedicated output unit running")
     }
 
@@ -240,6 +250,10 @@ final class MicProcessor {
 
         isRunning = false
         stopMeterTimer()
+        if let activity {
+            ProcessInfo.processInfo.endActivity(activity)
+            activity = nil
+        }
         outputLevel = 0
         logger.notice("MicProcessor stopped")
     }
