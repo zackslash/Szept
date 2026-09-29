@@ -242,11 +242,16 @@ final class MicProcessor {
     // MARK: - Metering
 
     private func startMeterTimer() {
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        // .common so the timer keeps firing while an NSMenu is tracking:
+        // the meter lives inside the open menu popup, where default-mode
+        // timers are suspended.
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self, self.isRunning else { return }
             let level = self.meterLevel
             if level != self.outputLevel { self.outputLevel = level }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
     }
 
     private func stopMeterTimer() {
