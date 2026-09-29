@@ -58,17 +58,11 @@ enum AppAction: CaseIterable {
         let defaults = UserDefaults.standard
         if appState.micProcessor.isRunning {
             appState.micProcessor.stop()
+            appState.invalidatePendingStarts()
             appState.lastError = nil
             defaults.set(false, forKey: "isProcessingEnabled")
         } else {
-            do {
-                try appState.micProcessor.start()
-                appState.lastError = nil
-                defaults.set(true, forKey: "isProcessingEnabled")
-            } catch {
-                // Stale device is the likely cause; re-resolve and retry once.
-                appState.startEngineWithRetry(reason: "engine")
-            }
+            appState.startEngineWithRetry(reason: "engine")
         }
     }
 

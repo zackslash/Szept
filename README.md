@@ -54,11 +54,13 @@ szept://bypass instead.
   future macOS version. Where it is unavailable, audio passes through
   unprocessed.
 - The input device and BlackHole run on unsynchronised clocks, so very
-  long sessions can drift.
+  long sessions can drift. Drift applies when the drift-free aggregate
+  toggle is off, or the aggregate falls back (it is default-on since
+  v0.2.0).
 - On macOS 26 the Control Center mic indicator and the microphone
-  privacy list may show a blank icon on some machines (seen under
-  constant rebuild churn with ad-hoc signing). Stable release installs
-  have shown the icon correctly. Cosmetic either way.
+  privacy list may show a blank icon (seen under constant rebuild churn
+  with ad-hoc signing; stable installs have shown it correctly).
+  Cosmetic.
 - Some USB interfaces expose more than one input entry and one of them
   can be wedged: start then fails with error -10875. Pick the other
   entry, or point the macOS system default at the healthy entry and let

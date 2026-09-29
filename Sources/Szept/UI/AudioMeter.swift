@@ -3,8 +3,7 @@ import SwiftUI
 struct AudioMeter: View, Equatable {
     let level: Float
 
-    // Level hysteresis: ignore sub-0.01 changes so the meter does not
-    // re-render on every sample.
+    // Level hysteresis: sub-0.01 changes skip the re-render.
     static func == (lhs: AudioMeter, rhs: AudioMeter) -> Bool {
         abs(lhs.level - rhs.level) < 0.01
     }

@@ -246,8 +246,7 @@ final class HotkeyManager {
     // MARK: - Dispatch
 
     /// Called by the Carbon C shim; maps the event to the slot's action and
-    /// hands it to the dispatch closure on the main thread. Releases map
-    /// only via `releaseAction` (momentary bypass only).
+    /// hands it to the dispatch closure on the main thread.
     fileprivate func handleHotKeyEvent(numericID: UInt32, pressed: Bool) {
         guard let slot = slot(forNumericID: numericID) else { return }
         let action = pressed ? slot.pressAction : slot.releaseAction

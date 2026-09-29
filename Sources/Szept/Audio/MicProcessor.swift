@@ -26,8 +26,8 @@ final class MicProcessor {
     // Process activity token held while the engine runs (App Nap guard).
     private var activity: NSObjectProtocol?
     // Display-side staleness tracking: when the capture stream stalls the
-    // render-side value stops changing, and the bar would freeze at the
-    // last speech level. These drive a decay instead. Main-thread only.
+    // render-side value stops changing and the bar would freeze at the
+    // last speech level. Main-thread only.
     private var lastRTLevel: Float = -1
     private var meterStaleTicks = 0
 
@@ -65,9 +65,9 @@ final class MicProcessor {
     }
 
     /// Preference-backed drift-fix switch (default on). Main thread only.
-    var useAggregateDevice: Bool {
-        get { UserDefaults.standard.object(forKey: "useAggregateDevice") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "useAggregateDevice") }
+    /// SettingsView writes the defaults key directly.
+    private var useAggregateDevice: Bool {
+        UserDefaults.standard.object(forKey: "useAggregateDevice") as? Bool ?? true
     }
 
     // MARK: - AVAudioEngine
@@ -261,6 +261,8 @@ final class MicProcessor {
     // MARK: - Metering
 
     private func startMeterTimer() {
+        // Clear any pre-stop value so a restart cannot flash it for one tick.
+        meterLevel = 0
         // .common so the timer keeps firing while an NSMenu is tracking:
         // the meter lives inside the open menu popup, where default-mode
         // timers are suspended.
@@ -270,12 +272,16 @@ final class MicProcessor {
             guard let self, self.isRunning else { return }
             let level = self.meterLevel
             if level != self.lastRTLevel {
-                // Fresh data: track it directly (instant attack).
+                // Fresh data: track it directly (instant attack). Write
+                // outputLevel only past a small display hysteresis
+                // (the view's own is 0.01).
                 self.lastRTLevel = level
                 self.meterStaleTicks = 0
-                if level != self.outputLevel { self.outputLevel = level }
+                if abs(level - self.outputLevel) > 0.005 { self.outputLevel = level }
             } else {
                 self.meterStaleTicks += 1
+                // Periodic probe: a live stream that repeats bit-identical values recovers.
+                if self.meterStaleTicks % 60 == 0 { self.lastRTLevel = -1 }
                 // ~300ms with no new value reads as a stalled stream:
                 // decay the bar toward zero instead of freezing it.
                 if self.meterStaleTicks >= 18 {
@@ -701,6 +707,7 @@ final class MicProcessor {
                 }
             }
         }
+        // Release: finish reading samples before advancing the read index.
         OSMemoryBarrier()
         ringRead = (ringRead + n) % ringCapacity
     }

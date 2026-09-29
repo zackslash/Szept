@@ -14,6 +14,16 @@ final class AppState {
     var micPermissionDenied: Bool = false
     var lastError: String?
 
+    // Bumped on every start attempt and every user stop; a pending retry
+    // carries the generation it was scheduled under and aborts if it no
+    // longer matches.
+    private(set) var startGeneration = 0
+
+    /// Invalidates any pending start retry (call from every user-stop path).
+    func invalidatePendingStarts() {
+        startGeneration += 1
+    }
+
     var currentMode: SzeptMode {
         guard micProcessor.isRunning else { return .off }
         if micModeMonitor.isVoiceIsolationActive { return .enhanced }
@@ -76,27 +86,31 @@ final class AppState {
     /// hint rather than a raw OSStatus. Every attempt and outcome is
     /// FileLog'd so post-mortems are possible.
     func startEngineWithRetry(reason: String) {
-        do {
+        startGeneration += 1
+        let generation = startGeneration
+
+        func attempt(_ tag: String) throws {
             try resolveAndAssignDevices()
             try micProcessor.start()
             let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
             micProcessor.applyQualityPreset(preset)
             lastError = nil
-            // Preference is never written false on failure, so a transient failure cannot disable an enabled auto-start; one attempt plus one retry, no loop.
+            // Preference is never written false on failure: a transient
+            // failure must not disable an enabled auto-start. One attempt
+            // plus one retry; no loop to guard against.
             UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
-            FileLog.log("\(reason): start succeeded")
+            FileLog.log("\(reason): \(tag)")
+        }
+
+        do {
+            try attempt("start succeeded")
         } catch {
             FileLog.log("\(reason): start failed: \(error.localizedDescription); retrying once in 1.5s after device re-resolution")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
+                guard generation == self.startGeneration else { return }
                 do {
-                    try self.resolveAndAssignDevices()
-                    try self.micProcessor.start()
-                    let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
-                    self.micProcessor.applyQualityPreset(preset)
-                    self.lastError = nil
-                    UserDefaults.standard.set(true, forKey: "isProcessingEnabled")
-                    FileLog.log("\(reason): start succeeded after retry")
+                    try self.attempt("start succeeded after retry")
                 } catch {
                     let ns = error as NSError
                     FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")

@@ -11,9 +11,15 @@ struct MenuView: View {
     // popup and About panel are NSPanels and excluded).
     private func openSettings() {
         NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        NSApp.activate(ignoringOtherApps: true)
-        for window in NSApp.windows where !(window is NSPanel) && window.canBecomeKey {
-            window.makeKeyAndOrderFront(nil)
+        FileLog.log("settings: sent showSettingsWindow action")
+        // Defer the activate/raise one turn: SwiftUI materializes the
+        // settings window asynchronously, so raising synchronously can
+        // miss it (and would leave the first open buried).
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            for window in NSApp.windows where !(window is NSPanel) && window.canBecomeKey {
+                window.makeKeyAndOrderFront(nil)
+            }
         }
     }
 

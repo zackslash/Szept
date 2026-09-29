@@ -85,7 +85,7 @@ final class LifecycleObserver {
             }
             FileLog.log("wake: engine was running, restarting in 2s")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                self?.startEngineWithRetry(reason: "wake", shouldStart: true)
+                self?.appState?.startEngineWithRetry(reason: "wake")
             }
         }
         observerTokens.append(wakeToken)
@@ -161,26 +161,22 @@ final class LifecycleObserver {
 
         let wasRunning = appState.micProcessor.isRunning
         FileLog.log("device: rebuild begin (\(reason)), wasRunning=\(wasRunning)")
-        if wasRunning { appState.micProcessor.stop() }
-        // Always re-resolve so a later manual Start also sees fresh devices.
-        startEngineWithRetry(reason: "rebuild (\(reason))", shouldStart: wasRunning)
-    }
-
-    // MARK: - Start with retry
-
-    /// Re-resolve-only path when the engine should stay idle; otherwise
-    /// delegates to AppState.startEngineWithRetry.
-    private func startEngineWithRetry(reason: String, shouldStart: Bool) {
-        guard let appState else { return }
-        guard shouldStart else {
+        if wasRunning {
+            appState.micProcessor.stop()
+            appState.invalidatePendingStarts()
+        }
+        let startReason = "rebuild (\(reason))"
+        if !wasRunning {
+            // Always re-resolve so a later manual Start also sees fresh
+            // devices, even when the engine stays idle.
             do {
                 try appState.resolveAndAssignDevices()
-                FileLog.log("\(reason): devices re-resolved (engine idle)")
+                FileLog.log("\(startReason): devices re-resolved (engine idle)")
             } catch {
-                FileLog.log("\(reason): device re-resolution failed: \(error.localizedDescription)")
+                FileLog.log("\(startReason): device re-resolution failed: \(error.localizedDescription)")
             }
             return
         }
-        appState.startEngineWithRetry(reason: reason)
+        appState.startEngineWithRetry(reason: startReason)
     }
 }
