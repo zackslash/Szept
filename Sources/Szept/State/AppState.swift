@@ -110,7 +110,7 @@ final class AppState {
                 guard let self else { return }
                 guard generation == self.startGeneration else { return }
                 do {
-                    try self.attempt("start succeeded after retry")
+                    try attempt("start succeeded after retry")
                 } catch {
                     let ns = error as NSError
                     FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
