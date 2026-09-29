@@ -56,8 +56,9 @@ szept://bypass instead.
 - The input device and BlackHole run on unsynchronised clocks, so very
   long sessions can drift.
 - On macOS 26 the Control Center mic indicator and the microphone
-  privacy list show a blank icon. Cosmetic, appears to be a Tahoe quirk
-  rather than a problem in this bundle.
+  privacy list may show a blank icon on some machines (seen under
+  constant rebuild churn with ad-hoc signing). Stable release installs
+  have shown the icon correctly. Cosmetic either way.
 - Some USB interfaces expose more than one input entry and one of them
   can be wedged: start then fails with error -10875. Pick the other
   entry, or point the macOS system default at the healthy entry and let
