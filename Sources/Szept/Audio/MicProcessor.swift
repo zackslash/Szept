@@ -253,8 +253,8 @@ final class MicProcessor {
 
         isRunning = false
         stopMeterTimer()
-        if let activity {
-            ProcessInfo.processInfo.endActivity(activity)
+        if let token = activity {
+            ProcessInfo.processInfo.endActivity(token)
             activity = nil
         }
         outputLevel = 0
