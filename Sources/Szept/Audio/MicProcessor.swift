@@ -266,7 +266,7 @@ final class MicProcessor {
         // timers are suspended.
         lastRTLevel = -1
         meterStaleTicks = 0
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self, self.isRunning else { return }
             let level = self.meterLevel
             if level != self.lastRTLevel {
@@ -278,9 +278,9 @@ final class MicProcessor {
                 self.meterStaleTicks += 1
                 // ~300ms with no new value reads as a stalled stream:
                 // decay the bar toward zero instead of freezing it.
-                if self.meterStaleTicks >= 9 {
+                if self.meterStaleTicks >= 18 {
                     if self.outputLevel > 0.001 {
-                        self.outputLevel *= 0.6
+                        self.outputLevel *= 0.8
                     } else if self.outputLevel != 0 {
                         self.outputLevel = 0
                     }
