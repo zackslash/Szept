@@ -23,6 +23,11 @@ final class MicProcessor {
     // the render thread never dispatches or allocates.
     nonisolated(unsafe) private var meterLevel: Float = 0
     private var meterTimer: Timer?
+    // Display-side staleness tracking: when the capture stream stalls the
+    // render-side value stops changing, and the bar would freeze at the
+    // last speech level. These drive a decay instead. Main-thread only.
+    private var lastRTLevel: Float = -1
+    private var meterStaleTicks = 0
 
     // MARK: - Clarity ("Broadcast Voice")
 
@@ -245,10 +250,28 @@ final class MicProcessor {
         // .common so the timer keeps firing while an NSMenu is tracking:
         // the meter lives inside the open menu popup, where default-mode
         // timers are suspended.
+        lastRTLevel = -1
+        meterStaleTicks = 0
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self, self.isRunning else { return }
             let level = self.meterLevel
-            if level != self.outputLevel { self.outputLevel = level }
+            if level != self.lastRTLevel {
+                // Fresh data: track it directly (instant attack).
+                self.lastRTLevel = level
+                self.meterStaleTicks = 0
+                if level != self.outputLevel { self.outputLevel = level }
+            } else {
+                self.meterStaleTicks += 1
+                // ~300ms with no new value reads as a stalled stream:
+                // decay the bar toward zero instead of freezing it.
+                if self.meterStaleTicks >= 9 {
+                    if self.outputLevel > 0.001 {
+                        self.outputLevel *= 0.6
+                    } else if self.outputLevel != 0 {
+                        self.outputLevel = 0
+                    }
+                }
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         meterTimer = timer
