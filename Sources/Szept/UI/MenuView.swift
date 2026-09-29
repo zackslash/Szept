@@ -1,7 +1,21 @@
 import SwiftUI
+import AppKit
 
 struct MenuView: View {
     @Environment(AppState.self) var appState
+
+    // SettingsLink alone does nothing when the settings window is already
+    // open but buried behind other windows: it neither raises nor
+    // activates it, and the window gets lost. Send the settings action,
+    // then pull the app forward and front its regular windows (the menu
+    // popup and About panel are NSPanels and excluded).
+    private func openSettings() {
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where !(window is NSPanel) && window.canBecomeKey {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -57,8 +71,8 @@ struct MenuView: View {
                 }
                 .buttonStyle(.borderless)
                 .contentShape(Rectangle())
-                SettingsLink {
-                    Text("Settings…")
+                Button("Settings…") {
+                    openSettings()
                 }
                 .buttonStyle(.borderless)
                 .contentShape(Rectangle())
