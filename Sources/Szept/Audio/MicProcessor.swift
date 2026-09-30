@@ -22,8 +22,9 @@ final class MicProcessor {
     // main-thread meter timer: one word-sized store/load needs no lock and
     // the render thread never dispatches or allocates.
     nonisolated(unsafe) private var meterLevel: Float = 0
-    // Diagnostic: taps in the current window, RT-incremented (single word,
-    // no allocation) and window-reset by the meter timer. A frozen meter
+    // Diagnostic: total taps since launch, RT-incremented (single word,
+    // no allocation) and the ONLY writer. The meter timer snapshots the
+    // monotonic total and computes per-window deltas. A frozen meter
     // with a tap rate near zero is a true render stall; a frozen meter
     // with a normal tap rate is a constant post-isolation residual.
     nonisolated(unsafe) private var tapCount = 0
@@ -40,6 +41,9 @@ final class MicProcessor {
     private var meterStaleTicks = 0
     private var meterTick = 0
     private var lastTapRate = -1
+    // Snapshot of the RT tap total at the last window close; deltas give
+    // the per-window rate without a second writer.
+    private var lastTapCount = 0
 
     // MARK: - Clarity ("Broadcast Voice")
 
@@ -277,6 +281,9 @@ final class MicProcessor {
         meterStaleTicks = 0
         meterTick = 0
         lastTapRate = -1
+        // Snapshot the total now: a stale carry across a restart yields a
+        // first-window rate of 0, not garbage.
+        lastTapCount = tapCount
         // .common so the timer keeps firing while an NSMenu is tracking:
         // the meter lives inside the open menu popup, where default-mode
         // timers are suspended.
@@ -286,8 +293,9 @@ final class MicProcessor {
             // 1s diagnostic window over the render tap count.
             self.meterTick += 1
             if self.meterTick % 60 == 0 {
-                self.lastTapRate = self.tapCount
-                self.tapCount = 0
+                let now = self.tapCount
+                self.lastTapRate = now &- self.lastTapCount
+                self.lastTapCount = now
             }
             if level != self.lastRTLevel {
                 if self.meterStaleTicks >= 18 {
