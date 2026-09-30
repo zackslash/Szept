@@ -22,6 +22,11 @@ final class MicProcessor {
     // main-thread meter timer: one word-sized store/load needs no lock and
     // the render thread never dispatches or allocates.
     nonisolated(unsafe) private var meterLevel: Float = 0
+    // Diagnostic: taps in the current window, RT-incremented (single word,
+    // no allocation) and window-reset by the meter timer. A frozen meter
+    // with a tap rate near zero is a true render stall; a frozen meter
+    // with a normal tap rate is a constant post-isolation residual.
+    nonisolated(unsafe) private var tapCount = 0
 
     // MARK: - Meter and process-activity state (main thread only)
 
@@ -33,6 +38,8 @@ final class MicProcessor {
     // last speech level.
     private var lastRTLevel: Float = -1
     private var meterStaleTicks = 0
+    private var meterTick = 0
+    private var lastTapRate = -1
 
     // MARK: - Clarity ("Broadcast Voice")
 
@@ -268,13 +275,24 @@ final class MicProcessor {
         meterLevel = 0
         lastRTLevel = -1
         meterStaleTicks = 0
+        meterTick = 0
+        lastTapRate = -1
         // .common so the timer keeps firing while an NSMenu is tracking:
         // the meter lives inside the open menu popup, where default-mode
         // timers are suspended.
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self, self.isRunning else { return }
             let level = self.meterLevel
+            // 1s diagnostic window over the render tap count.
+            self.meterTick += 1
+            if self.meterTick % 60 == 0 {
+                self.lastTapRate = self.tapCount
+                self.tapCount = 0
+            }
             if level != self.lastRTLevel {
+                if self.meterStaleTicks >= 18 {
+                    FileLog.log("meter: recovered after \(self.meterStaleTicks) stale ticks")
+                }
                 // Fresh data: track it directly (instant attack). Write
                 // outputLevel only beyond a small display hysteresis
                 // (the view's own is 0.01).
@@ -283,10 +301,15 @@ final class MicProcessor {
                 if abs(level - self.outputLevel) > 0.005 { self.outputLevel = level }
             } else {
                 self.meterStaleTicks += 1
-                // Periodic probe (1s): a live stream that repeats bit-identical values recovers.
-                if self.meterStaleTicks % 60 == 0 { self.lastRTLevel = -1 }
+                if self.meterStaleTicks == 18 {
+                    // One line per episode. A near-zero rate is a true
+                    // render stall; a normal rate (~40-90/s) is a constant
+                    // post-isolation residual. -1 = no window closed yet.
+                    let rate = self.lastTapRate < 0 ? "n/a" : "\(self.lastTapRate)/s"
+                    FileLog.log("meter: value frozen >300ms (tap rate \(rate))")
+                }
                 // ~300ms with no new value reads as a stalled stream:
-                // decay the bar toward zero instead of freezing it.
+                // decay the bar toward zero and keep it there.
                 if self.meterStaleTicks >= 18 {
                     if self.outputLevel > 0.001 {
                         self.outputLevel *= 0.8
@@ -409,6 +432,7 @@ final class MicProcessor {
         let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
 
         meterLevel = rms
+        tapCount &+= 1
     }
 
     private nonisolated func pushToRing(samples: UnsafePointer<Float>, count: Int) {
