@@ -4,18 +4,17 @@ import AppKit
 struct MenuView: View {
     @Environment(AppState.self) var appState
 
-    // SettingsLink alone does nothing when the settings window is already
-    // open but buried behind other windows: it neither raises nor
-    // activates it, and the window gets lost. Send the settings action,
-    // then pull the app forward and front its regular windows (the menu
-    // popup and About panel are NSPanels and excluded).
-    private func openSettings() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        FileLog.log("settings: sent showSettingsWindow action")
-        // Defer the activate/raise one turn: SwiftUI materializes the
-        // settings window asynchronously, so raising synchronously can
-        // miss it (and would leave the first open buried).
-        DispatchQueue.main.async {
+    // SettingsLink is the only opener that works in an LSUIElement app:
+    // the showSettingsWindow: action broadcast needs app-menu machinery a
+    // menu-bar-only app does not have, so a plain button + selector is a
+    // no-op (v0.2.4 regression). SettingsLink alone, though, neither
+    // raises an already-open window buried behind other apps' windows nor
+    // activates the app. So: SettingsLink opens/focuses, and a
+    // simultaneous gesture rides it with a delayed activate-and-raise of
+    // the app's regular windows (the menu popup and About panel are
+    // NSPanels and excluded).
+    private func raiseSettings() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             NSApp.activate(ignoringOtherApps: true)
             for window in NSApp.windows where !(window is NSPanel) && window.canBecomeKey {
                 window.makeKeyAndOrderFront(nil)
@@ -77,9 +76,10 @@ struct MenuView: View {
                 }
                 .buttonStyle(.borderless)
                 .contentShape(Rectangle())
-                Button("Settings…") {
-                    openSettings()
+                SettingsLink {
+                    Text("Settings…")
                 }
+                .simultaneousGesture(TapGesture().onEnded(raiseSettings))
                 .buttonStyle(.borderless)
                 .contentShape(Rectangle())
                 Spacer()
