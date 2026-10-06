@@ -149,7 +149,7 @@ final class LifecycleObserver {
         )
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &address, .main
-        ) { [weak self], _, _ in
+        ) { [weak self] _, _ in
             guard let self, let appState = self.appState else { return }
             // Filter our own aggregate AND the share multi-output from
             // both sets; snapshot updated every event.
