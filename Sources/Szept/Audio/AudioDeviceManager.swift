@@ -288,9 +288,7 @@ final class AudioDeviceManager {
     /// app-facing format; the member (BlackHole) runs with drift
     /// compensation. IsStacked is what makes this a MULTI-OUTPUT device
     /// (every member receives the same stream) rather than a channel-
-    /// concatenating aggregate. The device must not be private: it has to
-    /// be visible so the system (another process context) can adopt it as
-    /// the default output.
+    /// concatenating aggregate.
     ///
     /// Retry-once with the main key omitted: some HAL builds reject a main
     /// sub-device that is already the system default; without an explicit
@@ -398,10 +396,9 @@ final class AudioDeviceManager {
         }
     }
 
-    /// Read back a device's current nominal sample rate, mirroring
-    /// MicProcessor's private deviceSampleRate pattern. Used by the share
-    /// enable path to arm the mix-bus servo at the rate we actually got
-    /// (the 48k pin is best-effort and can fail).
+    /// Read back a device's current nominal sample rate; used to arm the
+    /// mix-bus servo at the rate actually obtained (the 48 kHz pin is
+    /// best-effort).
     static func nominalSampleRate(deviceID: AudioDeviceID) -> Double? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
@@ -414,8 +411,26 @@ final class AudioDeviceManager {
         return status == noErr && rate > 0 ? rate : nil
     }
 
-    /// Input-side channel count accessor, mirroring the existing output
-    /// variant. Used to identify BlackHole capture devices for sharing.
+    /// Set a device's nominal sample rate. Best effort by design: callers
+    /// read the rate back instead of trusting the set.
+    static func setNominalSampleRate(deviceID: AudioDeviceID, to rate: Double, logPrefix: String) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value = rate
+        let size = UInt32(MemoryLayout<Double>.size)
+        let status = withUnsafePointer(to: &value) { ptr in
+            AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, ptr)
+        }
+        if status != noErr {
+            FileLog.log("\(logPrefix): nominal rate set returned \(status) (continuing)")
+        }
+    }
+
+    /// Input-side twin of outputChannelCount. Used to identify BlackHole
+    /// capture devices for sharing.
     static func inputChannelCount(deviceID: AudioDeviceID) -> Int {
         (try? channelCount(deviceID: deviceID, scope: kAudioObjectPropertyScopeInput)) ?? 0
     }

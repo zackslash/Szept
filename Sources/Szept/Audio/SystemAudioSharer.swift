@@ -24,10 +24,19 @@ final class SystemAudioSharer {
     /// match a configuration-change notification by object identity.
     private(set) var currentEngine: AVAudioEngine?
     private var multiOutputID: AudioDeviceID?
+    /// The multi-output's BlackHole member, exposed so a mic rebuild can
+    /// detect a member collision (the same BlackHole in both the private
+    /// aggregate and the multi-output is the forbidden configuration).
+    private(set) var memberDeviceID: AudioDeviceID?
     /// The render rate the mix bus servo was armed with (set in enable()).
     /// A rate-changing mic rebuild must re-enable the share instead of
     /// leaving the servo at a stale nominal ratio.
     private(set) var armedRenderRate: Double?
+    /// When the share was enabled. Guards the config-change handler against
+    /// the start-time configuration change AVAudioEngine can post as the
+    /// input format finalizes; real device loss is covered by the
+    /// device-list watchdog, so the grace loses nothing.
+    private var enabledAt: Date?
 
     // MARK: - Enable
 
@@ -41,9 +50,15 @@ final class SystemAudioSharer {
     func enable(micProcessor: MicProcessor) throws {
         guard !isSharing else { return }
 
-        // 1. BlackHole 16ch is REQUIRED. Prefer it by name; fall back to
-        // any BlackHole capture device that is not the mic engine's own
-        // output device and exposes at least 2 input channels.
+        // Suppression FIRST, before any default-output flip this call may
+        // trigger (including the stale-cleanup restore in step 3): the
+        // window is time-based, so opening it early is harmless and closing
+        // it late is impossible to get wrong.
+        beginSuppression()
+
+        // 1. Prefer BlackHole 16ch by name; fall back to any other
+        // BlackHole that is not the mic engine's own output device and
+        // exposes at least 2 input channels.
         let allDevices = (try? AudioDeviceManager.allDevices()) ?? []
         let blackHoles = allDevices.filter { $0.name.localizedCaseInsensitiveContains("BlackHole") }
         var bh16 = blackHoles.first {
@@ -61,10 +76,19 @@ final class SystemAudioSharer {
             }
         }
         guard let blackHole = bh16 else {
+            // A 16ch that exists but is excluded is a different problem from
+            // one that is missing: the fix is a second device, not an install.
+            let excluded16 = blackHoles.contains {
+                $0.name.localizedCaseInsensitiveContains("BlackHole")
+                    && $0.name.localizedCaseInsensitiveContains("16")
+            }
             throw NSError(domain: "Szept", code: 30,
-                          userInfo: [NSLocalizedDescriptionKey: "BlackHole 16ch not installed (brew install --cask blackhole-16ch)"])
+                          userInfo: [NSLocalizedDescriptionKey: excluded16
+                              ? "BlackHole 16ch is in use as the Szept output device. Install a second BlackHole (2ch or 16ch) for system-audio sharing."
+                              : "BlackHole 16ch not installed (brew install --cask blackhole-16ch)"])
         }
-        setDeviceSampleRate(blackHole.id, to: 48000)
+        AudioDeviceManager.setNominalSampleRate(deviceID: blackHole.id, to: 48000,
+                                                logPrefix: "share")
 
         // 2. Arm the mix bus: capture at the BH16 rate we actually got
         // (read back after the best-effort 48k pin; the pin can fail), render
@@ -89,18 +113,22 @@ final class SystemAudioSharer {
                     throw NSError(domain: "Szept", code: 32,
                                   userInfo: [NSLocalizedDescriptionKey: "System default output is a loopback device. Set your real speakers as the default output, then share."])
                 }
+                guard current != Self.multiOutputUID else {
+                    throw NSError(domain: "Szept", code: 34,
+                                  userInfo: [NSLocalizedDescriptionKey: "Share was left as the system default and the previous output is gone. Pick a default output in System Settings, then share again."])
+                }
                 UserDefaults.standard.set(current, forKey: Self.previousOutputKey)
             }
 
             // 4. Multi-output: previous default (the speakers) as clock
             // master and app-facing format, BlackHole as drift-compensated
-            // member. NEVER put the same device in both this and the mic
-            // engine's private aggregate.
+            // member.
             guard let mainUID = AudioDeviceManager.defaultOutputDeviceUID() else {
                 throw NSError(domain: "Szept", code: 31,
                               userInfo: [NSLocalizedDescriptionKey: "Could not read the current output device"])
             }
             let memberUID = blackHole.uid
+            memberDeviceID = blackHole.id
             multiOutputID = try AudioDeviceManager.createMultiOutputDevice(
                 mainUID: mainUID, memberUID: memberUID
             )
@@ -109,14 +137,17 @@ final class SystemAudioSharer {
             }
 
             // 5. Suppression window first: flipping the default output makes
-            // engine1's muted output unit fire a configuration change that
-            // would otherwise trigger a full mic rebuild mid-presentation.
-            // The window self-expires (~1.5s); it is never closed early so
-            // the async change lands inside it.
-            beginSuppression()
+            // the mic engine's muted output unit fire a configuration change
+            // that would otherwise trigger a full mic rebuild
+            // mid-presentation. The window self-expires (~1.5s); it is never
+            // closed early so the async change lands inside it.
             try AudioDeviceManager.setDefaultOutputDevice(id: multiOutputID)
 
             let engine = AVAudioEngine()
+            // Assign BEFORE wiring: isSharing is still false, so identity-
+            // matched notifications are dropped for now, and the catch's
+            // teardown branch is correct from this point on.
+            currentEngine = engine
             let inputNode = engine.inputNode
             guard let inputAU = inputNode.audioUnit else {
                 throw NSError(domain: "Szept", code: 33,
@@ -153,9 +184,7 @@ final class SystemAudioSharer {
 
             engine.prepare()
             try engine.start()
-            currentEngine = engine
         } catch {
-            // Full rollback on any failure at any step.
             if let engine = currentEngine {
                 engine.inputNode.removeTap(onBus: 0)
                 engine.stop()
@@ -176,6 +205,7 @@ final class SystemAudioSharer {
         // 6. Published last: the UI and the render path only see the share
         // once engine, device flip, and mix bus are all live.
         isSharing = true
+        enabledAt = Date()
         FileLog.log("share: system audio sharing enabled")
     }
 
@@ -186,6 +216,12 @@ final class SystemAudioSharer {
     /// so the restore can never dangle on a destroyed device.
     func disable() {
         guard isSharing || currentEngine != nil || multiOutputID != nil else { return }
+
+        // Suppression FIRST: the default-output RESTORE flip below is the
+        // mirror of the enable flip and equally fires the mic engine's
+        // configuration change; unsuppressed, every share-off mid-call
+        // would trigger a mic rebuild (~1-1.5s dropout).
+        beginSuppression()
 
         // Barrier first: the render thread stops mixing immediately; the
         // ring is intentionally never freed.
@@ -208,8 +244,10 @@ final class SystemAudioSharer {
             AudioDeviceManager.destroyShareMultiOutput(id: id)
         }
         multiOutputID = nil
+        memberDeviceID = nil
         isSharing = false
         armedRenderRate = nil
+        enabledAt = nil
         FileLog.log("share: system audio sharing disabled")
     }
 
@@ -220,8 +258,13 @@ final class SystemAudioSharer {
     /// path broke, so tear the share down.
     func handleEngineConfigChange() {
         guard isSharing else { return }
-        FileLog.log("share: capture engine config changed, disabling")
-        disable()
+        // Grace: AVAudioEngine can post a start-time configuration change
+        // as the input format finalizes; ignore those (device-list watchdog
+        // covers real loss).
+        if let enabledAt, Date().timeIntervalSince(enabledAt) > 1.0 {
+            FileLog.log("share: capture engine config changed, disabling")
+            disable()
+        }
     }
 
     /// Device-list change: if BlackHole 16ch or the multi-output vanished,
@@ -256,16 +299,10 @@ final class SystemAudioSharer {
     /// output, restore the saved previous device (if resolvable), then
     /// destroy every match.
     static func cleanupStaleDevices() {
-        guard let devices = try? AudioDeviceManager.allDevices() else { return }
-        let matches = devices.filter { $0.uid == multiOutputUID }
-        guard !matches.isEmpty else { return }
-
         if AudioDeviceManager.defaultOutputDeviceUID() == multiOutputUID {
             restorePreviousOutputFromDefaults()
         }
-        for device in matches {
-            AudioDeviceManager.destroyShareMultiOutput(id: device.id)
-        }
+        AudioDeviceManager.findAndDestroyStaleShareMultiOutput()
     }
 
     /// Restore the default output from the saved UID when it resolves.
@@ -281,24 +318,6 @@ final class SystemAudioSharer {
         FileLog.log("share: default output restored to \(uid)")
     }
 
-    // MARK: - Helpers
-
-    private func setDeviceSampleRate(_ deviceID: AudioDeviceID, to rate: Double) {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var value = rate
-        let size = UInt32(MemoryLayout<Double>.size)
-        let status = withUnsafePointer(to: &value) { ptr in
-            AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, ptr)
-        }
-        if status != noErr {
-            FileLog.log("share: BlackHole nominal rate set returned \(status) (continuing)")
-        }
-    }
-
     // MARK: - Suppression window
 
     /// Owns the timestamp the lifecycle observer checks. Main thread only.
@@ -307,7 +326,7 @@ final class SystemAudioSharer {
 
     var isSuppressingRebuild: Bool { Date() < suppressionUntil }
 
-    /// Open the window around the default-output flip + engine2 start.
+    /// Open the window around the default-output flip + capture engine start.
     private func beginSuppression() {
         suppressionUntil = Date().addingTimeInterval(Self.suppressionInterval)
     }

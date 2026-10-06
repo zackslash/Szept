@@ -28,23 +28,15 @@ final class HotkeyManager {
         case shareAudio
         case voiceMute
 
-        /// Action fired when the combo is pressed. nil = press ignored.
-        var pressAction: AppAction? {
-            switch self {
-            case .toggleEngine:     return .toggleEngine
-            case .cycleClarity:     return .cycleClarity
-            case .strengthUp:       return .strengthUp
-            case .strengthDown:     return .strengthDown
-            case .bypassMomentary:  return .bypassOn
-            case .shareAudio:       return .shareToggle
-            case .voiceMute:        return .voiceMuteToggle
-            }
-        }
-
         /// Action fired when the combo is released. nil (every slot except
         /// the momentary bypass) = release ignored.
         var releaseAction: AppAction? {
             self == .bypassMomentary ? .bypassOff : nil
+        }
+
+        /// Action fired when the combo is pressed. nil = press ignored.
+        var pressAction: AppAction? {
+            HotkeyManager.config(for: self).pressAction
         }
     }
 
@@ -55,40 +47,57 @@ final class HotkeyManager {
         var modifierMask: UInt32   // Carbon masks: cmdKey/shiftKey/optionKey/controlKey
     }
 
-    static func prefKey(for slot: Slot) -> String {
+    /// Everything that varies per slot, in one exhaustive switch.
+    private struct Config {
+        let pressAction: AppAction?
+        let prefKey: String
+        let defaultBinding: Binding
+        let label: String
+    }
+
+    private static func config(for slot: Slot) -> Config {
         switch slot {
-        case .toggleEngine:     return "hotkey.toggle"
-        case .cycleClarity:     return "hotkey.clarity"
-        case .strengthUp:       return "hotkey.strengthUp"
-        case .strengthDown:     return "hotkey.strengthDown"
-        case .bypassMomentary:  return "hotkey.bypass"
-        case .shareAudio:       return "hotkey.shareAudio"
-        case .voiceMute:        return "hotkey.voiceMute"
+        case .toggleEngine:
+            return Config(pressAction: .toggleEngine, prefKey: "hotkey.toggle",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_N), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Start/stop processing")
+        case .cycleClarity:
+            return Config(pressAction: .cycleClarity, prefKey: "hotkey.clarity",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_C), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Cycle clarity")
+        case .strengthUp:
+            return Config(pressAction: .strengthUp, prefKey: "hotkey.strengthUp",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_RightBracket), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Isolation strength up")
+        case .strengthDown:
+            return Config(pressAction: .strengthDown, prefKey: "hotkey.strengthDown",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_LeftBracket), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Isolation strength down")
+        case .bypassMomentary:
+            return Config(pressAction: .bypassOn, prefKey: "hotkey.bypass",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_B), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Bypass A/B (hold)")
+        case .shareAudio:
+            return Config(pressAction: .shareToggle, prefKey: "hotkey.shareAudio",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_S), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Share system audio")
+        case .voiceMute:
+            return Config(pressAction: .voiceMuteToggle, prefKey: "hotkey.voiceMute",
+                          defaultBinding: Binding(keyCode: UInt32(kVK_ANSI_M), modifierMask: UInt32(controlKey | optionKey)),
+                          label: "Mute mic")
         }
+    }
+
+    static func prefKey(for slot: Slot) -> String {
+        config(for: slot).prefKey
     }
 
     static func defaultBinding(for slot: Slot) -> Binding {
-        switch slot {
-        case .toggleEngine:     return Binding(keyCode: UInt32(kVK_ANSI_N), modifierMask: UInt32(controlKey | optionKey))
-        case .cycleClarity:     return Binding(keyCode: UInt32(kVK_ANSI_C), modifierMask: UInt32(controlKey | optionKey))
-        case .strengthUp:       return Binding(keyCode: UInt32(kVK_ANSI_RightBracket), modifierMask: UInt32(controlKey | optionKey))
-        case .strengthDown:     return Binding(keyCode: UInt32(kVK_ANSI_LeftBracket), modifierMask: UInt32(controlKey | optionKey))
-        case .bypassMomentary:  return Binding(keyCode: UInt32(kVK_ANSI_B), modifierMask: UInt32(controlKey | optionKey))
-        case .shareAudio:       return Binding(keyCode: UInt32(kVK_ANSI_S), modifierMask: UInt32(controlKey | optionKey))
-        case .voiceMute:        return Binding(keyCode: UInt32(kVK_ANSI_M), modifierMask: UInt32(controlKey | optionKey))
-        }
+        config(for: slot).defaultBinding
     }
 
     static func label(for slot: Slot) -> String {
-        switch slot {
-        case .toggleEngine:     return "Start/stop processing"
-        case .cycleClarity:     return "Cycle clarity"
-        case .strengthUp:       return "Isolation strength up"
-        case .strengthDown:     return "Isolation strength down"
-        case .bypassMomentary:  return "Bypass A/B (hold)"
-        case .shareAudio:       return "Share system audio"
-        case .voiceMute:        return "Mute mic"
-        }
+        config(for: slot).label
     }
 
     /// Persistence format: "keyCode:modifierMask".

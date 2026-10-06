@@ -28,10 +28,8 @@ final class MicProcessor {
     // the render thread never dispatches or allocates.
     nonisolated(unsafe) private var meterLevel: Float = 0
     // Diagnostic: total taps since launch, RT-incremented (single word,
-    // no allocation) and the ONLY writer. The meter timer snapshots the
-    // monotonic total and computes per-window deltas. A frozen meter
-    // with a tap rate near zero is a true render stall; a frozen meter
-    // with a normal tap rate is a constant post-isolation residual.
+    // no allocation, only writer); the meter timer snapshots the total and
+    // computes per-window deltas.
     nonisolated(unsafe) private var tapCount = 0
     // Optional system-audio mix bus, injected once at init by AppState and
     // never mutated afterwards. Consumed by drainRing (render thread) when
@@ -330,9 +328,7 @@ final class MicProcessor {
             } else {
                 self.meterStaleTicks += 1
                 if self.meterStaleTicks == 18 {
-                    // One line per episode. A near-zero rate is a true
-                    // render stall; a normal rate (~40-90/s) is a constant
-                    // post-isolation residual. -1 = no window closed yet.
+                    // One line per episode: near-zero rate = true render stall; normal rate = constant raw-input level.
                     let rate = self.lastTapRate < 0 ? "n/a" : "\(self.lastTapRate)/s"
                     FileLog.log("meter: value frozen >300ms (tap rate \(rate))")
                 }
@@ -465,7 +461,7 @@ final class MicProcessor {
         // discarded work.
         guard !voiceMuted else { return }
 
-        // Post-chain signal feeds both the ring and the meter.
+        // Post-chain signal feeds the ring.
         voiceChain.process(channelData, count: frameCount)
         DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 0.7)
 
@@ -473,8 +469,7 @@ final class MicProcessor {
     }
 
     /// Main thread. Mutes only the VOICE leg; system-audio sharing (if
-    /// active) keeps flowing to the call. Not persisted: a fresh launch is
-    /// always audible.
+    /// active) keeps flowing to the call.
     func setVoiceMuted(_ on: Bool) {
         guard on != voiceMuted else { return }
         voiceMuted = on
@@ -723,31 +718,11 @@ final class MicProcessor {
     }
 
     private func alignDeviceSampleRate(_ deviceID: AudioDeviceID, to rate: Double) {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var value = rate
-        let size = UInt32(MemoryLayout<Double>.size)
-        let status = withUnsafePointer(to: &value) { ptr in
-            AudioObjectSetPropertyData(deviceID, &addr, 0, nil, size, ptr)
-        }
-        if status != noErr {
-            FileLog.log("output: nominal rate set returned \(status) (continuing)")
-        }
+        AudioDeviceManager.setNominalSampleRate(deviceID: deviceID, to: rate, logPrefix: "output")
     }
 
     private func deviceSampleRate(_ deviceID: AudioDeviceID) -> Double? {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var rate: Double = 0
-        var size = UInt32(MemoryLayout<Double>.size)
-        let status = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &rate)
-        return status == noErr && rate > 0 ? rate : nil
+        AudioDeviceManager.nominalSampleRate(deviceID: deviceID)
     }
 
     // Runs on the output unit's render thread. Must not allocate or block.
@@ -784,14 +759,13 @@ final class MicProcessor {
         // (drainRing), after the sample/zero-fill loops, NOT in
         // processTap/pushToRing (the mic producer): system audio must
         // bypass the entire mic filter chain (isolation/clarity/limiter)
-        // and land on top of the already-processed voice. When the bus is
-        // inactive this branch is not taken and the path is bit-identical
-        // to today. Only when frames were actually mixed do we re-limit:
-        // the mic leg is limited at 0.7 and the system leg sits at 0.8, so
-        // the sum can reach ~1.8; the post-mix knee at 0.85 tucks those
-        // peaks while remaining an exact identity below it. The knee also
-        // applies to mic peaks in (0.85, 1.0) while sharing with silent
-        // system audio - an intentional consistent ceiling either way.
+        // and land on top of the already-processed voice. Only when frames
+        // were actually mixed do we re-limit: the mic leg is limited at 0.7
+        // and the system leg sits at 0.8, so the sum can reach ~1.8; the
+        // post-mix knee at 0.85 tucks those peaks while remaining an exact
+        // identity below it. The knee also applies to mic peaks in
+        // (0.85, 1.0) while sharing with silent system audio - an
+        // intentional consistent ceiling either way.
         if let bus = systemMixBus, bus.isActive, bus.readMixing(into: list, frames: frames) {
             for buffer in list {
                 if let data = buffer.mData?.assumingMemoryBound(to: Float.self) {

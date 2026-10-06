@@ -26,7 +26,8 @@ final class AppState {
     }
 
     /// Enable/disable system-audio sharing, surfacing any failure to the
-    /// error banner. Main thread only.
+    /// error banner. Main thread only. lastError is cleared only when an
+    /// actual transition occurred.
     func setSystemAudio(_ on: Bool) {
         if on {
             // Sharing requires the mic pipeline to be up: the mix bus is
@@ -42,21 +43,10 @@ final class AppState {
                 lastError = error.localizedDescription
             }
         } else {
+            guard systemSharer.isSharing else { return }
             systemSharer.disable()
             lastError = nil
         }
-    }
-
-    // MARK: - Voice-only mute
-
-    func toggleVoiceMute() {
-        setVoiceMuted(!micProcessor.voiceMuted)
-    }
-
-    /// Voice-leg mute wrapper. Never persisted anywhere: mute is a session
-    /// control and a fresh launch always starts audible.
-    func setVoiceMuted(_ on: Bool) {
-        micProcessor.setVoiceMuted(on)
     }
 
     // Bumped on every start attempt and every stop (user or rebuild); a
@@ -78,16 +68,11 @@ final class AppState {
     var statusDescription: String {
         guard micProcessor.isRunning else { return "Processing off" }
         if micProcessor.isBypassed { return "Bypass A/B active." }
-        // The muted line comes first: it outranks any mode/share text
-        // (before any share line) because it changes what the call hears.
-        var lines: [String] = []
-        if micProcessor.voiceMuted { lines.append("Mic muted") }
-        switch currentMode {
-        case .enhanced:   lines.append("Szept active with system Voice Isolation. Strongest noise reduction.")
-        case .standalone: lines.append("Szept active. Turn on Voice Isolation in Control Center for stronger noise reduction.")
-        case .off:        lines.append("Processing off")
-        }
-        return lines.joined(separator: "\n")
+        // The muted line comes first: it changes what the call hears.
+        let base = micModeMonitor.isVoiceIsolationActive
+            ? "Szept active with system Voice Isolation. Strongest noise reduction."
+            : "Szept active. Turn on Voice Isolation in Control Center for stronger noise reduction."
+        return micProcessor.voiceMuted ? "Mic muted\n" + base : base
     }
 
     // MARK: - Device resolution
@@ -152,6 +137,12 @@ final class AppState {
                     let ns = error as NSError
                     FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
                     self.lastError = EngineStartError.message(for: error)
+                    // Share cannot outlive a dead engine: same rule as the
+                    // engine-off path. The user re-toggles share after
+                    // recovery, same as post-sleep.
+                    if self.systemSharer.isSharing {
+                        self.systemSharer.disable()
+                    }
                 }
             }
         }
@@ -165,15 +156,17 @@ final class AppState {
         let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
         micProcessor.applyQualityPreset(preset)
         lastError = nil
-        // A rebuild that changed the render rate leaves the share's mix-bus
-        // servo armed against a stale rate. Re-enable (never a bare re-arm:
-        // resetting ring indices while the capture tap is live corrupts the
-        // ring). This disable/enable pair must not itself trigger a mic
-        // rebuild: the sharer's own multi-output create/destroy is filtered
-        // out of the lifecycle observer's device snapshots.
+        // A rate change since arm() leaves the servo on a stale nominal
+        // ratio: re-enable - never a bare re-arm (resetting ring indices
+        // under a live capture tap corrupts the ring). A member collision
+        // (the rebuilt private aggregate around the same BlackHole the
+        // multi-output contains) is the other forbidden state, so it forces
+        // a re-enable too. The sharer's create/destroy is filtered from the
+        // observer's snapshots, so the pair cannot trigger a rebuild.
         if systemSharer.isSharing,
-           let rate = micProcessor.renderSampleRate,
-           rate != systemSharer.armedRenderRate {
+           (micProcessor.renderSampleRate != systemSharer.armedRenderRate
+               && micProcessor.renderSampleRate != nil)
+               || systemSharer.memberDeviceID == micProcessor.outputDeviceID {
             systemSharer.disable()
             do { try systemSharer.enable(micProcessor: micProcessor) }
             catch { lastError = error.localizedDescription }

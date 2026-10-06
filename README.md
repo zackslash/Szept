@@ -42,15 +42,18 @@ access when prompted.
 2. Call app: microphone set to BlackHole 2ch, its own noise suppression
    off.
 3. Strength is a fixed choice: Gentle, Medium, or Max.
+4. Share system audio (per session): needs BlackHole 16ch (brew install
+   --cask blackhole-16ch). Toggle from the menu; never persists across
+   launches. Point the call app's speakers at your real output to avoid
+   echo.
 
 Hotkeys: ctrl+opt+N start or stop, ctrl+opt+C cycle clarity, ctrl+opt+[
-and ctrl+opt+] strength, ctrl+opt+B hold to bypass. Stream Deck and
-scripts can open szept://toggle, szept://clarity, szept://strength, and
-szept://bypass instead.
-ctrl+opt+M toggles voice mute (mic only; system-audio sharing keeps
-flowing to the call).
-szept://voicemute, szept://voicemute/on, and szept://voicemute/off do
-the same from scripts.
+and ctrl+opt+] strength, ctrl+opt+B hold to bypass, ctrl+opt+S share
+system audio, ctrl+opt+M mute mic (mic only; sharing keeps flowing).
+Stream Deck and scripts can open szept://toggle, szept://clarity,
+szept://strength, szept://bypass, szept://systemaudio, and
+szept://voicemute instead; each takes /on and /off except toggle,
+clarity, and strength (use /down there).
 
 ## Known issues
 

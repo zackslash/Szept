@@ -38,7 +38,7 @@ private struct AboutCard: View {
     }
 
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        AppVersion.string
     }
 }
 
@@ -201,6 +201,6 @@ private struct AboutTab: View {
     }
 
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        AppVersion.string
     }
 }

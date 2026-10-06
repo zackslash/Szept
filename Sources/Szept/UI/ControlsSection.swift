@@ -5,9 +5,8 @@ struct ControlsSection: View {
     @AppStorage("qualityPreset") private var qualityPreset: String = "aggressive"
 
     var body: some View {
-        let processor = appState.micProcessor
         VStack(alignment: .leading, spacing: 10) {
-            qualityRow(processor: processor)
+            qualityRow()
             muteRow
             shareRow
         }
@@ -15,7 +14,7 @@ struct ControlsSection: View {
         .padding(.vertical, 8)
     }
 
-    private func qualityRow(processor: MicProcessor) -> some View {
+    private func qualityRow() -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Strength")
                 .font(.subheadline)
@@ -26,9 +25,9 @@ struct ControlsSection: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .disabled(!processor.isRunning)
+            .disabled(!appState.micProcessor.isRunning)
             .onChange(of: qualityPreset) { _, newValue in
-                processor.applyQualityPreset(newValue)
+                appState.micProcessor.applyQualityPreset(newValue)
             }
         }
     }
@@ -58,7 +57,7 @@ struct ControlsSection: View {
             ))
             .disabled(!appState.micProcessor.isRunning)
             if appState.systemSharer.isSharing {
-                Text("System audio is mixed into the call. Point Teams speakers at your real output to avoid echo.")
+                Text("System audio is mixed into the call. Point your call app's speakers at your real output to avoid echo.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

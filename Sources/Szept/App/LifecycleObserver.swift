@@ -118,9 +118,7 @@ final class LifecycleObserver {
                 appState.systemSharer.handleEngineConfigChange()
                 return
             }
-            // Suppression window: flipping the default output makes
-            // engine1's muted output unit fire a configuration change,
-            // which would otherwise kill the mic for ~2s mid-presentation.
+            // Self-inflicted change from the sharer's default-output flip (see SystemAudioSharer.enable step 5): suppress, don't rebuild.
             if appState.systemSharer.isSuppressingRebuild {
                 FileLog.log("lifecycle: rebuild suppressed (self-inflicted)")
                 return
@@ -133,9 +131,10 @@ final class LifecycleObserver {
     }
 
     // External device UIDs as of the last device-list event, with our own
-    // aggregate filtered out. Our own aggregate create/destroy calls fire
-    // this same listener; comparing filtered sets keeps them invisible to
-    // the rebuild logic so they cannot trigger a stop/start churn loop.
+    // aggregate and share multi-output filtered out. Our own device
+    // create/destroy calls fire this same listener; comparing filtered sets
+    // keeps them invisible to the rebuild logic so they cannot trigger a
+    // stop/start churn loop.
     private var lastExternalDeviceUIDs: Set<String> = []
 
     /// Coarse HAL signal that the device list changed (USB blip, coreaudiod
@@ -151,14 +150,11 @@ final class LifecycleObserver {
             AudioObjectID(kAudioObjectSystemObject), &address, .main
         ) { [weak self] _, _ in
             guard let self, let appState = self.appState else { return }
-            // Filter our own aggregate AND the share multi-output from
-            // both sets; snapshot updated every event.
+            // Filter our own devices from the current set; the stored snapshot is already filtered.
             let current = Set(((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid))
             let filteredCurrent = current.subtracting([
                 AudioDeviceManager.aggregateUID, AudioDeviceManager.shareMultiOutputUID
             ])
-            // Compare before the snapshot is refreshed: the stored set is
-            // already filtered, no need to filter it again here.
             let changed = filteredCurrent != self.lastExternalDeviceUIDs
             self.lastExternalDeviceUIDs = filteredCurrent
             // Let the sharer react to BlackHole/multi-output loss before

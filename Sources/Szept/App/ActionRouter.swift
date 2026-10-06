@@ -3,7 +3,7 @@ import Foundation
 /// Every user-facing action the control layer can fire (hotkeys, `szept://`
 /// URLs). Pure value type with no AppKit or Carbon dependencies, so it can be
 /// constructed from any entry point.
-enum AppAction: CaseIterable {
+enum AppAction {
     case toggleEngine
     case cycleClarity
     case strengthUp
@@ -70,11 +70,11 @@ enum AppAction: CaseIterable {
         case .shareOff:
             appState.setSystemAudio(false)
         case .voiceMuteToggle:
-            appState.toggleVoiceMute()
+            appState.micProcessor.setVoiceMuted(!appState.micProcessor.voiceMuted)
         case .voiceMuteOn:
-            appState.setVoiceMuted(true)
+            appState.micProcessor.setVoiceMuted(true)
         case .voiceMuteOff:
-            appState.setVoiceMuted(false)
+            appState.micProcessor.setVoiceMuted(false)
         }
     }
 

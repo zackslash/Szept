@@ -13,8 +13,8 @@ import CoreAudio
 /// million, so a naive fixed-rate resampler slowly drifts: the ring fills
 /// toward overflow (system audio lags) or underruns to silence (system
 /// audio leads). Rather than run a full asynchronous sample-rate converter,
-/// a small occupancy servo nudges the read ratio a fraction of a percent
-/// toward the target occupancy (a quarter of the ring). The rate change per
+/// a small occupancy servo nudges the read ratio by at most a couple of
+/// percent toward the target occupancy (a quarter of the ring). The rate change per
 /// step is far below audibility (it is what every clock-recovery PLL in a
 /// USB audio device does), and the ring depth of ~0.34 s absorbs the
 /// moment-to-moment jitter while the servo absorbs the long-term drift.
@@ -60,7 +60,7 @@ final class SystemMixBus {
         writeIndex = 0
         readIndex = 0
         phase = 0
-        nominalRatio = outputRate > 0 ? inputRate / outputRate : 1
+        nominalRatio = (inputRate > 0 && outputRate > 0) ? inputRate / outputRate : 1
         ratio = nominalRatio
         // Barrier: publish all of the above before the activity flag.
         OSMemoryBarrier()
@@ -90,7 +90,6 @@ final class SystemMixBus {
         OSMemoryBarrier()
         let available = (capacity + readIndex - writeIndex - 1 + capacity) % capacity
         let n = min(count, available)
-        // On overflow keep the OLDEST n samples (drop the newest head).
         let start = count - n
         for i in 0..<n {
             ring[(writeIndex + i) % capacity] = samples[start + i]
@@ -118,11 +117,15 @@ final class SystemMixBus {
     /// Render thread (consumer). Called from drainRing AFTER the mic
     /// sample/zero-fill loops: adds `gain * sys` into every channel buffer
     /// on top of whatever the mic path wrote. Advances the read position by
-    /// the servo ratio per output frame; on underrun it writes nothing,
-    /// freezes the ratio (no advance), and returns false.
+    /// the servo ratio per output frame; on a full underrun (nothing mixed)
+    /// it publishes nothing (no advance) and returns false.
     ///
     /// Must not allocate or block.
     nonisolated func readMixing(into list: UnsafeMutableAudioBufferListPointer, frames: Int) -> Bool {
+        // Acquire for the arm()-published trio (readIndex/phase/ratio and
+        // nominalRatio); the caller's plain isActive load does not order
+        // them.
+        OSMemoryBarrier()
         guard let ring else { return false }
 
         var mixedAny = false
@@ -163,8 +166,7 @@ final class SystemMixBus {
             // is capped at two percent so the instantaneous pitch error
             // stays inaudible.
             let quarter = Double(capacity) / 4
-            var correction = 0.02 * (Double(occupancy) - quarter) / quarter
-            correction = max(-0.02, min(0.02, correction))
+            let correction = max(-0.02, min(0.02, 0.02 * (Double(occupancy) - quarter) / quarter))
             localRatio = nominalRatio * (1 + correction)
 
             localPhase += localRatio

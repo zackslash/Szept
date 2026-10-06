@@ -25,9 +25,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         registerDefaults()
         loadPreferencesIntoProcessor()
-        // Launch-time stale cleanup BEFORE the lifecycle observer is
-        // created and any engine starts: a crashed session can leave the
-        // share multi-output behind (possibly as the default output).
+        // Before the observer/engine: crash leftovers can include the default output.
         SystemAudioSharer.cleanupStaleDevices()
         setupStatusItem()
         setupHotkeys()
@@ -194,12 +192,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func updateStatusItemIcon() {
         guard let button = statusItem?.button else { return }
-        // Precedence order, strongest signal first:
-        // 1. mic.slash.fill  - running AND voice muted (a muted mic changes
-        //    what the call hears, so it outranks any processing state)
-        // 2. checkmark.shield.fill - enhanced (Voice Isolation stacked)
-        // 3. waveform.circle.fill - standalone processing
-        // 4. waveform.circle - off
+        // Mute outranks any processing state: a muted mic changes what the call hears.
         let symbolName: String
         if appState.micProcessor.isRunning, appState.micProcessor.voiceMuted {
             symbolName = "mic.slash.fill"

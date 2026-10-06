@@ -1,5 +1,11 @@
 import SwiftUI
 
+/// Single source for the version string shown in the About card and the
+/// About panel (they previously disagreed on the fallback).
+enum AppVersion {
+    static let string = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+}
+
 /// Loads the bundled `AppIcon.icns`. Shared by the Settings About card and
 /// the custom About panel. SwiftUI `Image` cannot read `.icns` assets by
 /// name, and `NSApplication.icon` may not be set yet when a window opens.
@@ -41,6 +47,6 @@ struct AboutPanelContent: View {
     }
 
     static var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        AppVersion.string
     }
 }
