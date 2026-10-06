@@ -8,6 +8,7 @@ struct ControlsSection: View {
         let processor = appState.micProcessor
         VStack(alignment: .leading, spacing: 10) {
             qualityRow(processor: processor)
+            muteRow
             shareRow
         }
         .padding(.horizontal, 12)
@@ -28,6 +29,23 @@ struct ControlsSection: View {
             .disabled(!processor.isRunning)
             .onChange(of: qualityPreset) { _, newValue in
                 processor.applyQualityPreset(newValue)
+            }
+        }
+    }
+
+    private var muteRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Mute mic", isOn: Binding(
+                get: { appState.micProcessor.voiceMuted },
+                set: { _ in AppAction.voiceMuteToggle.perform(on: appState) }
+            ))
+            .disabled(!appState.micProcessor.isRunning)
+            if appState.micProcessor.voiceMuted {
+                Text(appState.systemSharer.isSharing
+                     ? "Mic muted. System audio still flows to the call."
+                     : "Mic muted.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

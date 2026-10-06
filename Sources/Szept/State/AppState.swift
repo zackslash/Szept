@@ -47,6 +47,18 @@ final class AppState {
         }
     }
 
+    // MARK: - Voice-only mute
+
+    func toggleVoiceMute() {
+        setVoiceMuted(!micProcessor.voiceMuted)
+    }
+
+    /// Voice-leg mute wrapper. Never persisted anywhere: mute is a session
+    /// control and a fresh launch always starts audible.
+    func setVoiceMuted(_ on: Bool) {
+        micProcessor.setVoiceMuted(on)
+    }
+
     // Bumped on every start attempt and every stop (user or rebuild); a
     // pending retry carries the generation it was scheduled under and
     // aborts if it no longer matches.
@@ -66,11 +78,16 @@ final class AppState {
     var statusDescription: String {
         guard micProcessor.isRunning else { return "Processing off" }
         if micProcessor.isBypassed { return "Bypass A/B active." }
+        // The muted line comes first: it outranks any mode/share text
+        // (before any share line) because it changes what the call hears.
+        var lines: [String] = []
+        if micProcessor.voiceMuted { lines.append("Mic muted") }
         switch currentMode {
-        case .enhanced:   return "Szept active with system Voice Isolation. Strongest noise reduction."
-        case .standalone: return "Szept active. Turn on Voice Isolation in Control Center for stronger noise reduction."
-        case .off:        return "Processing off"
+        case .enhanced:   lines.append("Szept active with system Voice Isolation. Strongest noise reduction.")
+        case .standalone: lines.append("Szept active. Turn on Voice Isolation in Control Center for stronger noise reduction.")
+        case .off:        lines.append("Processing off")
         }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Device resolution

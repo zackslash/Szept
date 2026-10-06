@@ -181,6 +181,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func observeMode() {
         withObservationTracking {
             _ = appState.currentMode
+            // The icon also depends on the voice mute (mic.slash.fill
+            // precedence), so track it too.
+            _ = appState.micProcessor.voiceMuted
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 self?.updateStatusItemIcon()
@@ -191,11 +194,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func updateStatusItemIcon() {
         guard let button = statusItem?.button else { return }
+        // Precedence order, strongest signal first:
+        // 1. mic.slash.fill  - running AND voice muted (a muted mic changes
+        //    what the call hears, so it outranks any processing state)
+        // 2. checkmark.shield.fill - enhanced (Voice Isolation stacked)
+        // 3. waveform.circle.fill - standalone processing
+        // 4. waveform.circle - off
         let symbolName: String
-        switch appState.currentMode {
-        case .enhanced:    symbolName = "checkmark.shield.fill"
-        case .standalone:  symbolName = "waveform.circle.fill"
-        case .off:         symbolName = "waveform.circle"
+        if appState.micProcessor.isRunning, appState.micProcessor.voiceMuted {
+            symbolName = "mic.slash.fill"
+        } else {
+            switch appState.currentMode {
+            case .enhanced:    symbolName = "checkmark.shield.fill"
+            case .standalone:  symbolName = "waveform.circle.fill"
+            case .off:         symbolName = "waveform.circle"
+            }
         }
         let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Szept")
         image?.isTemplate = true

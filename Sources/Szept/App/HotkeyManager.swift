@@ -26,6 +26,7 @@ final class HotkeyManager {
         case strengthDown
         case bypassMomentary
         case shareAudio
+        case voiceMute
 
         /// Action fired when the combo is pressed. nil = press ignored.
         var pressAction: AppAction? {
@@ -36,6 +37,7 @@ final class HotkeyManager {
             case .strengthDown:     return .strengthDown
             case .bypassMomentary:  return .bypassOn
             case .shareAudio:       return .shareToggle
+            case .voiceMute:        return .voiceMuteToggle
             }
         }
 
@@ -61,6 +63,7 @@ final class HotkeyManager {
         case .strengthDown:     return "hotkey.strengthDown"
         case .bypassMomentary:  return "hotkey.bypass"
         case .shareAudio:       return "hotkey.shareAudio"
+        case .voiceMute:        return "hotkey.voiceMute"
         }
     }
 
@@ -72,6 +75,7 @@ final class HotkeyManager {
         case .strengthDown:     return Binding(keyCode: UInt32(kVK_ANSI_LeftBracket), modifierMask: UInt32(controlKey | optionKey))
         case .bypassMomentary:  return Binding(keyCode: UInt32(kVK_ANSI_B), modifierMask: UInt32(controlKey | optionKey))
         case .shareAudio:       return Binding(keyCode: UInt32(kVK_ANSI_S), modifierMask: UInt32(controlKey | optionKey))
+        case .voiceMute:        return Binding(keyCode: UInt32(kVK_ANSI_M), modifierMask: UInt32(controlKey | optionKey))
         }
     }
 
@@ -83,6 +87,7 @@ final class HotkeyManager {
         case .strengthDown:     return "Isolation strength down"
         case .bypassMomentary:  return "Bypass A/B (hold)"
         case .shareAudio:       return "Share system audio"
+        case .voiceMute:        return "Mute mic"
         }
     }
 

@@ -14,6 +14,9 @@ enum AppAction: CaseIterable {
     case shareToggle
     case shareOn
     case shareOff
+    case voiceMuteToggle
+    case voiceMuteOn
+    case voiceMuteOff
 
     /// Parse a `szept://` URL into an action. In custom-scheme URLs the verb
     /// is the host; an optional sub-verb is the first path component, e.g.
@@ -34,6 +37,11 @@ enum AppAction: CaseIterable {
         case ("systemaudio", "on"):  return .shareOn
         case ("systemaudio", "off"): return .shareOff
         case ("systemaudio", _):     return .shareToggle
+        // Voice-only mute. Deliberately NOT "mute": that verb was removed
+        // for double-mute risk and stays unrecognized.
+        case ("voicemute", "on"):  return .voiceMuteOn
+        case ("voicemute", "off"): return .voiceMuteOff
+        case ("voicemute", _):     return .voiceMuteToggle
         default:                   return nil
         }
     }
@@ -61,6 +69,12 @@ enum AppAction: CaseIterable {
             appState.setSystemAudio(true)
         case .shareOff:
             appState.setSystemAudio(false)
+        case .voiceMuteToggle:
+            appState.toggleVoiceMute()
+        case .voiceMuteOn:
+            appState.setVoiceMuted(true)
+        case .voiceMuteOff:
+            appState.setVoiceMuted(false)
         }
     }
 

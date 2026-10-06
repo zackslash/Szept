@@ -91,6 +91,20 @@ final class ActionRouterURLTests: XCTestCase {
         XCTAssertEqual(action("szept://bypass"), .bypassToggle)
     }
 
+    func testVoiceMuteOnOffAndToggle() {
+        XCTAssertEqual(action("szept://voicemute/on"), .voiceMuteOn)
+        XCTAssertEqual(action("szept://voicemute/off"), .voiceMuteOff)
+        XCTAssertEqual(action("szept://voicemute"), .voiceMuteToggle)
+        // Unknown sub-verb falls through to toggle, like bypass.
+        XCTAssertEqual(action("szept://voicemute/nonsense"), .voiceMuteToggle)
+    }
+
+    func testMuteVerbStaysRemoved() {
+        // voicemute exists, but the bare removed verb must stay nil.
+        XCTAssertNil(action("szept://mute"))
+        XCTAssertNil(action("szept://mute/on"))
+    }
+
     func testUnknownSchemeIsNil() {
         XCTAssertNil(AppAction.from(url: URL(string: "http://toggle")!))
         XCTAssertNil(AppAction.from(url: URL(string: "nonoisemac://toggle")!))
@@ -127,6 +141,19 @@ final class HotkeyManagerBindingTests: XCTestCase {
             XCTAssertFalse(HotkeyManager.prefKey(for: slot).isEmpty)
             XCTAssertNotNil(HotkeyManager.decode(HotkeyManager.encode(HotkeyManager.defaultBinding(for: slot))))
         }
+    }
+
+    func testVoiceMuteSlotBinding() {
+        let slot = HotkeyManager.Slot.voiceMute
+        XCTAssertEqual(HotkeyManager.prefKey(for: slot), "hotkey.voiceMute")
+        XCTAssertEqual(HotkeyManager.label(for: slot), "Mute mic")
+        // Press-only: fires on press, no release action.
+        XCTAssertEqual(slot.pressAction, .voiceMuteToggle)
+        XCTAssertNil(slot.releaseAction)
+        // Default ctrl+opt+M (kVK_ANSI_M = 46, control|option = 0x1800 = 6144).
+        let binding = HotkeyManager.defaultBinding(for: slot)
+        XCTAssertEqual(binding.keyCode, 46)
+        XCTAssertEqual(binding.modifierMask, UInt32(controlKey | optionKey))
     }
 }
 

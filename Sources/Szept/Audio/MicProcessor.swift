@@ -18,6 +18,11 @@ final class MicProcessor {
     // MARK: - Audio thread state (read from callbacks; nonisolated(unsafe))
 
     nonisolated(unsafe) private var tapIsolation: Float = 50
+    // Voice-only mute. Main-thread writes via setVoiceMuted, render thread
+    // reads in processTap; single word, same pattern as tapIsolation.
+    // Session-scoped: never persisted anywhere, so a fresh launch always
+    // starts audible.
+    nonisolated(unsafe) private(set) var voiceMuted = false
     // Latest output RMS. Written only by the render thread, polled by the
     // main-thread meter timer: one word-sized store/load needs no lock and
     // the render thread never dispatches or allocates.
@@ -446,16 +451,34 @@ final class MicProcessor {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return }
 
+        // Meter FIRST, on the raw input: while muted the meter stays live
+        // and shows the level you WOULD be sending. tapCount keeps ticking
+        // too, so the meter-stall diagnostic cannot false-positive.
+        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
+        meterLevel = rms
+        tapCount &+= 1
+
+        // Voice-only mute: stop BEFORE the chain and the ring. The ring
+        // simply runs dry and drainRing zero-fills, so the voice leg
+        // becomes digital silence while the system mix (added in drainRing
+        // after the fill) keeps flowing. Skipping the chain also saves the
+        // discarded work.
+        guard !voiceMuted else { return }
+
         // Post-chain signal feeds both the ring and the meter.
         voiceChain.process(channelData, count: frameCount)
         DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 0.7)
 
         pushToRing(samples: channelData, count: frameCount)
+    }
 
-        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
-
-        meterLevel = rms
-        tapCount &+= 1
+    /// Main thread. Mutes only the VOICE leg; system-audio sharing (if
+    /// active) keeps flowing to the call. Not persisted: a fresh launch is
+    /// always audible.
+    func setVoiceMuted(_ on: Bool) {
+        guard on != voiceMuted else { return }
+        voiceMuted = on
+        FileLog.log(on ? "voice: muted" : "voice: unmuted")
     }
 
     private nonisolated func pushToRing(samples: UnsafePointer<Float>, count: Int) {

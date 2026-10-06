@@ -47,6 +47,10 @@ Hotkeys: ctrl+opt+N start or stop, ctrl+opt+C cycle clarity, ctrl+opt+[
 and ctrl+opt+] strength, ctrl+opt+B hold to bypass. Stream Deck and
 scripts can open szept://toggle, szept://clarity, szept://strength, and
 szept://bypass instead.
+ctrl+opt+M toggles voice mute (mic only; system-audio sharing keeps
+flowing to the call).
+szept://voicemute, szept://voicemute/on, and szept://voicemute/off do
+the same from scripts.
 
 ## Known issues
 
