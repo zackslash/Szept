@@ -9,10 +9,43 @@ enum SzeptMode: String {
 
 @Observable
 final class AppState {
-    let micProcessor = MicProcessor()
+    let systemSharer = SystemAudioSharer()
+    let micProcessor: MicProcessor
     let micModeMonitor = MicModeMonitor()
     var micPermissionDenied: Bool = false
     var lastError: String?
+
+    init() {
+        micProcessor = MicProcessor(systemMixBus: systemSharer.mixBus)
+    }
+
+    // MARK: - System audio sharing
+
+    func toggleSystemAudio() {
+        setSystemAudio(!systemSharer.isSharing)
+    }
+
+    /// Enable/disable system-audio sharing, surfacing any failure to the
+    /// error banner. Main thread only.
+    func setSystemAudio(_ on: Bool) {
+        if on {
+            // Sharing requires the mic pipeline to be up: the mix bus is
+            // consumed by its render path.
+            guard micProcessor.isRunning else {
+                lastError = "Start processing before sharing system audio."
+                return
+            }
+            do {
+                try systemSharer.enable(micProcessor: micProcessor)
+                lastError = nil
+            } catch {
+                lastError = error.localizedDescription
+            }
+        } else {
+            systemSharer.disable()
+            lastError = nil
+        }
+    }
 
     // Bumped on every start attempt and every stop (user or rebuild); a
     // pending retry carries the generation it was scheduled under and
@@ -115,6 +148,19 @@ final class AppState {
         let preset = UserDefaults.standard.string(forKey: "qualityPreset") ?? "aggressive"
         micProcessor.applyQualityPreset(preset)
         lastError = nil
+        // A rebuild that changed the render rate leaves the share's mix-bus
+        // servo armed against a stale rate. Re-enable (never a bare re-arm:
+        // resetting ring indices while the capture tap is live corrupts the
+        // ring). This disable/enable pair must not itself trigger a mic
+        // rebuild: the sharer's own multi-output create/destroy is filtered
+        // out of the lifecycle observer's device snapshots.
+        if systemSharer.isSharing,
+           let rate = micProcessor.renderSampleRate,
+           rate != systemSharer.armedRenderRate {
+            systemSharer.disable()
+            do { try systemSharer.enable(micProcessor: micProcessor) }
+            catch { lastError = error.localizedDescription }
+        }
         // Preference is never written false on failure: a transient
         // failure must not disable an enabled auto-start. One attempt
         // plus one retry; no loop to guard against.

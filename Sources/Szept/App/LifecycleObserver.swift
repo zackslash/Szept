@@ -37,10 +37,13 @@ final class LifecycleObserver {
         observeDeviceList()
         // Prime the snapshot so our own first aggregate creation does not
         // look like an external device-list change and trigger a spurious
-        // rebuild right after the first start.
+        // rebuild right after the first start. The share multi-output is
+        // filtered for the same reason: our own create/destroy must be
+        // invisible, and a crash-leftover found at launch must not look
+        // external.
         lastExternalDeviceUIDs = Set(
             ((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid)
-        ).subtracting([AudioDeviceManager.aggregateUID])
+        ).subtracting([AudioDeviceManager.aggregateUID, AudioDeviceManager.shareMultiOutputUID])
         FileLog.log("lifecycle: observer installed")
     }
 
@@ -67,6 +70,12 @@ final class LifecycleObserver {
                 FileLog.log("sleep: stopping engine")
             } else {
                 self.wasRunningBeforeSleep = false
+            }
+            // Never sleep with the share multi-output as the default
+            // output: the wake path would leave the meeting device wrong.
+            if appState.systemSharer.isSharing {
+                appState.systemSharer.disable()
+                FileLog.log("sleep: system audio sharing disabled")
             }
         }
         observerTokens.append(sleepToken)
@@ -99,8 +108,23 @@ final class LifecycleObserver {
             forName: .AVAudioEngineConfigurationChange,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             guard let self, let appState = self.appState else { return }
+            // Object-identity check FIRST: a configuration change on the
+            // share capture engine is the sharer's problem, not a mic
+            // rebuild trigger.
+            if let engine = notification.object as? AVAudioEngine,
+               engine === appState.systemSharer.currentEngine {
+                appState.systemSharer.handleEngineConfigChange()
+                return
+            }
+            // Suppression window: flipping the default output makes
+            // engine1's muted output unit fire a configuration change,
+            // which would otherwise kill the mic for ~2s mid-presentation.
+            if appState.systemSharer.isSuppressingRebuild {
+                FileLog.log("lifecycle: rebuild suppressed (self-inflicted)")
+                return
+            }
             guard appState.micProcessor.isRunning else { return }
             FileLog.log("device: configuration changed")
             self.scheduleRebuild(reason: "engine configuration change")
@@ -125,16 +149,22 @@ final class LifecycleObserver {
         )
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &address, .main
-        ) { [weak self] _, _ in
+        ) { [weak self], _, _ in
             guard let self, let appState = self.appState else { return }
-            // Filter our own aggregate from both sets; snapshot updated
-            // every event.
+            // Filter our own aggregate AND the share multi-output from
+            // both sets; snapshot updated every event.
             let current = Set(((try? AudioDeviceManager.allDevices()) ?? []).map(\.uid))
-            let filteredCurrent = current.subtracting([AudioDeviceManager.aggregateUID])
+            let filteredCurrent = current.subtracting([
+                AudioDeviceManager.aggregateUID, AudioDeviceManager.shareMultiOutputUID
+            ])
             // Compare before the snapshot is refreshed: the stored set is
             // already filtered, no need to filter it again here.
             let changed = filteredCurrent != self.lastExternalDeviceUIDs
             self.lastExternalDeviceUIDs = filteredCurrent
+            // Let the sharer react to BlackHole/multi-output loss before
+            // the mic rebuild guard: a dead share member must tear the
+            // share down even when the mic engine itself is not running.
+            appState.systemSharer.handleDeviceListChange()
             guard appState.micProcessor.isRunning, changed else { return }
             self.scheduleRebuild(reason: "system device list changed")
         }

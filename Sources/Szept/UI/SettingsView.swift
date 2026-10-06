@@ -147,6 +147,9 @@ private struct AudioTab: View {
                 Text("Bridges the input and BlackHole on one clock. Takes effect on the next start. Turn off if output stops working.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text("Share system audio requires BlackHole 16ch (brew install --cask blackhole-16ch). It is started from the menu, per session, and never persists across launches.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Clarity") {
                 LabeledContent("Broadcast voice") {

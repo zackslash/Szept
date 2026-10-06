@@ -11,6 +11,9 @@ enum AppAction: CaseIterable {
     case bypassOn
     case bypassOff
     case bypassToggle
+    case shareToggle
+    case shareOn
+    case shareOff
 
     /// Parse a `szept://` URL into an action. In custom-scheme URLs the verb
     /// is the host; an optional sub-verb is the first path component, e.g.
@@ -28,6 +31,9 @@ enum AppAction: CaseIterable {
         case ("bypass", "on"):     return .bypassOn
         case ("bypass", "off"):    return .bypassOff
         case ("bypass", _):        return .bypassToggle
+        case ("systemaudio", "on"):  return .shareOn
+        case ("systemaudio", "off"): return .shareOff
+        case ("systemaudio", _):     return .shareToggle
         default:                   return nil
         }
     }
@@ -49,6 +55,12 @@ enum AppAction: CaseIterable {
             appState.micProcessor.setBypassed(false)
         case .bypassToggle:
             appState.micProcessor.setBypassed(!appState.micProcessor.isBypassed)
+        case .shareToggle:
+            appState.toggleSystemAudio()
+        case .shareOn:
+            appState.setSystemAudio(true)
+        case .shareOff:
+            appState.setSystemAudio(false)
         }
     }
 
@@ -58,6 +70,9 @@ enum AppAction: CaseIterable {
         let defaults = UserDefaults.standard
         if appState.micProcessor.isRunning {
             appState.micProcessor.stop()
+            // Szept off = everything off: the share mixes into the mic
+            // render path, so it cannot outlive the engine.
+            appState.systemSharer.disable()
             appState.invalidatePendingStarts()
             appState.lastError = nil
             defaults.set(false, forKey: "isProcessingEnabled")

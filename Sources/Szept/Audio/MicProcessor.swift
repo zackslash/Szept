@@ -28,6 +28,20 @@ final class MicProcessor {
     // with a tap rate near zero is a true render stall; a frozen meter
     // with a normal tap rate is a constant post-isolation residual.
     nonisolated(unsafe) private var tapCount = 0
+    // Optional system-audio mix bus, injected once at init by AppState and
+    // never mutated afterwards. Consumed by drainRing (render thread) when
+    // system-audio sharing is armed; nil/inactive leaves the render path
+    // bit-identical to the unshared pipeline.
+    let systemMixBus: SystemMixBus?
+
+    init(systemMixBus: SystemMixBus? = nil) {
+        self.systemMixBus = systemMixBus
+    }
+
+    /// The engine input/render rate of the current start, read by the
+    /// system-audio sharer to arm its mix bus servo. Written by start()
+    /// only; single-word store, read cross-thread.
+    nonisolated(unsafe) var renderSampleRate: Double?
 
     // MARK: - Meter and process-activity state (main thread only)
 
@@ -192,6 +206,7 @@ final class MicProcessor {
 
         // Arm the clarity chain with the render rate.
         voiceChain.configure(sampleRate: Float(inputFormat.sampleRate))
+        renderSampleRate = inputFormat.sampleRate
 
         // Reset the ring before the engine starts so the tap (producer)
         // never races the reset. Allocated once, reused forever.
@@ -742,6 +757,26 @@ final class MicProcessor {
                 }
             }
         }
+        // System-audio mix point. This runs in the OUTPUT-UNIT render path
+        // (drainRing), after the sample/zero-fill loops, NOT in
+        // processTap/pushToRing (the mic producer): system audio must
+        // bypass the entire mic filter chain (isolation/clarity/limiter)
+        // and land on top of the already-processed voice. When the bus is
+        // inactive this branch is not taken and the path is bit-identical
+        // to today. Only when frames were actually mixed do we re-limit:
+        // the mic leg is limited at 0.7 and the system leg sits at 0.8, so
+        // the sum can reach ~1.8; the post-mix knee at 0.85 tucks those
+        // peaks while remaining an exact identity below it. The knee also
+        // applies to mic peaks in (0.85, 1.0) while sharing with silent
+        // system audio - an intentional consistent ceiling either way.
+        if let bus = systemMixBus, bus.isActive, bus.readMixing(into: list, frames: frames) {
+            for buffer in list {
+                if let data = buffer.mData?.assumingMemoryBound(to: Float.self) {
+                    DSP.applySoftLimiter(samples: data, count: frames, threshold: 0.85)
+                }
+            }
+        }
+
         // Release: finish reading samples before advancing the read index.
         OSMemoryBarrier()
         ringRead = (ringRead + n) % ringCapacity

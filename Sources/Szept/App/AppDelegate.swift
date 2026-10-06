@@ -25,6 +25,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         registerDefaults()
         loadPreferencesIntoProcessor()
+        // Launch-time stale cleanup BEFORE the lifecycle observer is
+        // created and any engine starts: a crashed session can leave the
+        // share multi-output behind (possibly as the default output).
+        SystemAudioSharer.cleanupStaleDevices()
         setupStatusItem()
         setupHotkeys()
         observeMode()
@@ -93,6 +97,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Sharer first: it must restore the default output and destroy the
+        // multi-output while the mic engine is still alive.
+        appState.systemSharer.disable()
         appState.micProcessor.stop()
     }
 
@@ -164,7 +171,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             rootView: MenuView().environment(appState)
         )
 
-        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 300)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 360)
 
         menuItem.view = hostingView
         menu.addItem(menuItem)
