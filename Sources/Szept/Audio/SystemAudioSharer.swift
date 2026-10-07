@@ -38,7 +38,7 @@ final class SystemAudioSharer {
     /// restart-after-stop is flaky). Exposed so the lifecycle observer can
     /// match a configuration-change notification by object identity.
     private(set) var currentEngine: AVAudioEngine?
-    private var multiOutputID: AudioDeviceID?
+    private(set) var multiOutputID: AudioDeviceID?
     /// The multi-output's BlackHole member, exposed so a mic rebuild can
     /// detect a member collision (the same BlackHole in both the private
     /// aggregate and the multi-output is the forbidden configuration).

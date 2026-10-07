@@ -80,10 +80,10 @@ final class LifecycleObserver {
             FileLog.log("device: enumeration failed, ignoring")
             return []
         }
-        let ownIDs: Set<AudioDeviceID> = [
+        let ownIDs: Set<AudioDeviceID> = Set([
             appState.micProcessor.aggregateDeviceID,
             appState.systemSharer.multiOutputID
-        ].compactMap { $0 }
+        ].compactMap { $0 })
         let uidExcluded: Set<AudioDeviceID> = Set(
             ((try? AudioDeviceManager.allDevices()) ?? [])
                 .filter { $0.uid == AudioDeviceManager.aggregateUID
