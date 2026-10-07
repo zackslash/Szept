@@ -28,13 +28,17 @@ import CoreAudio
 /// inputNode.outputFormat(forBus: 0) parking main after our own pin.
 /// Therefore both enable and disable do their engine/HAL work on a
 /// dedicated worker queue (shareQueue), main only publishes state, and an
-/// 8s watchdog converts a parked worker into a self-heal: the parked
-/// queue is abandoned and replaced (bounded leak: one DispatchQueue + one
-/// parked thread + at most one engine per wedge, capped at three per
-/// incident), the wedged session state is reset on main, and the user is
-/// told to try again. Only after the heal budget is exhausted (three
-/// failed heals) does sharing latch "restart the app" (code 37).
-/// Prevention shrinks the park window; the watchdog contains the rest.
+/// 8s watchdog converts a parked worker into a latched "stuck" state
+/// (code 37) recoverable only by an app restart. A queue-replacement
+/// self-heal was implemented in round 7 and reverted in round 8: the
+/// wedge outlives the heal, and each heal+retry cycle re-manufactures
+/// the multi-output churn that triggers it (parks went 1 to 4 across 27
+/// pairs, hitting the cap-derived ceiling of 4). The latch is
+/// load-bearing: after a park, the correct action is to stop touching
+/// the device. The E1-E3 hardening (worker-local engine rollback,
+/// identity-guarded transfer releases, generation-guarded finish)
+/// stands. Prevention shrinks the park window; the watchdog contains
+/// the rest.
 ///
 /// Prevention layer (as of round 3): ZERO node-format queries anywhere on
 /// the enable path. hang #2 was outputFormat(forBus:), hang #3 was
@@ -71,12 +75,7 @@ final class SystemAudioSharer {
     /// Worker queue for every engine/HAL mutation (invariant I5). Main
     /// never dispatches sync onto this queue, so main.sync hops from the
     /// queue back to main are deadlock-free.
-    ///
-    /// Var, not let: the watchdog heal REPLACES a wedged queue (its worker
-    /// is parked forever). Written ONLY here on main (the heal), read ONLY
-    /// from the two @MainActor entries (enable/disable). The generation
-    /// suffix makes an abandoned queue attributable in spindumps.
-    private var shareQueue = DispatchQueue(label: "dev.zackslash.Szept.share",
+    private let shareQueue = DispatchQueue(label: "dev.zackslash.Szept.share",
                                            qos: .userInitiated)
 
     private(set) var isSharing = false
@@ -85,15 +84,12 @@ final class SystemAudioSharer {
     private(set) var isBusy = false
     var mixBus = SystemMixBus()
 
-    /// True only after the heal budget is exhausted (three wedges that
-    /// self-healing could not clear). All transitions refuse to start
-    /// while set; a returning stale worker that rolls back cleanly proves
-    /// the un-wedge and resets it (clearWedgeIfStale).
-    private(set) var healsExhausted = false
-    /// Wedges self-healed this incident. Bumped by the watchdog heal,
-    /// zeroed by a clean stale-worker rollback and by a successful enable
-    /// publish; heals stop (latching restart-required) past 3.
-    private var healCount = 0
+    /// Set by the watchdog when a transition worker parks past the 8s
+    /// deadline. All transitions refuse to start while set; only a
+    /// returning stale worker that rolled back cleanly clears it
+    /// (clearWedgeIfStale). Otherwise only an app restart clears it (the
+    /// wedged worker cannot be unwound safely).
+    private(set) var shareQueueWedged = false
     /// Last-recovery message for the user (watchdog parking, etc.). The
     /// next UI toggle surfaces it via lastError.
     private(set) var userNotice: String?
@@ -177,10 +173,10 @@ final class SystemAudioSharer {
     @MainActor
     func enable(micProcessor: MicProcessor) async throws {
         guard !isSharing else { return }
-        if healsExhausted {
-            FileLog.log("share: enable refused, heal budget exhausted (app restart required)")
+        if shareQueueWedged {
+            FileLog.log("share: enable refused, share queue wedged (app restart required)")
             throw NSError(domain: "Szept", code: 37,
-                          userInfo: [NSLocalizedDescriptionKey: "Sharing is stuck. Restart the app."])
+                          userInfo: [NSLocalizedDescriptionKey: "Sharing stopped after a snag and needs an app restart. Everything else keeps working."])
         }
         if isTearingDown {
             throw NSError(domain: "Szept", code: 35,
@@ -402,11 +398,7 @@ final class SystemAudioSharer {
 
             // 7. Published last: the UI and the render path only see the
             // share once engine, device flip, and mix bus are all live.
-            // One successful enable re-arms the full heal budget.
-            publishIfCurrent(gen) {
-                self.isSharing = true
-                self.healCount = 0
-            }
+            publishIfCurrent(gen) { self.isSharing = true }
             FileLog.log("share: [done] system audio sharing enabled")
         } catch {
             let ns = error as NSError
@@ -873,28 +865,25 @@ final class SystemAudioSharer {
         DispatchQueue.main.sync { gen != self.transitionGeneration }
     }
 
-    /// Clear the heals-exhausted latch if this worker is stale (the
-    /// watchdog fired on it) and it managed to return and roll back: the
-    /// queue demonstrably still runs, so sharing can be retried. A
-    /// returned worker is proof of un-wedge, so trust resets: the heal
-    /// count is zeroed alongside the latch. Safe main.sync (I5).
+    /// Clear the wedge latch if this worker is stale (the watchdog fired on
+    /// it) and it managed to return and roll back: the queue demonstrably
+    /// still runs, so sharing can be retried without an app restart. Safe
+    /// main.sync (I5).
     private func clearWedgeIfStale(_ gen: Int) {
         DispatchQueue.main.sync {
-            guard gen != self.transitionGeneration, self.healsExhausted else { return }
-            self.healsExhausted = false
-            self.healCount = 0
-            FileLog.log("share: parked worker returned and rolled back; heals-exhausted latch cleared, heal budget reset")
+            guard gen != self.transitionGeneration, self.shareQueueWedged else { return }
+            self.shareQueueWedged = false
+            FileLog.log("share: parked worker returned and rolled back; wedge cleared")
         }
     }
 
     /// +8s main-side watchdog for the current transition: if the worker is
     /// still busy when it fires, the worker is parked in an engine/HAL
-    /// call and may NEVER return. Self-heal instead of hanging the app:
-    /// clear the flags so the UI unlocks, abandon the parked queue by
-    /// replacing it, reset the wedged session state on main, and bump the
-    /// generation so the (possibly eventually-returning) worker's flips
-    /// are all treated as stale. After three failed heals, latch
-    /// restart-required (healsExhausted).
+    /// call and may NEVER return. Declare sharing stuck instead of hanging
+    /// the app: clear the busy flags so the UI unlocks, set the wedged
+    /// flag so no new transition starts, and bump the generation so the
+    /// (possibly eventually-returning) worker's flips are all treated as
+    /// stale.
     private func armWatchdog(_ gen: Int) {
         // Re-arming supersedes prior pending watchdogs: without the epoch
         // guard, the code-38 retry's legitimate ~10s path (4s probe cap +
@@ -913,74 +902,16 @@ final class SystemAudioSharer {
                 guard let self else { return }
                 guard epoch == self.watchdogEpoch, self.isBusy,
                       gen == self.transitionGeneration else { return }
-                FileLog.log("share: transition timed out; worker parked - self-healing")
+                FileLog.log("share: transition timed out; worker parked - sharing marked stuck")
                 self.isSharing = false
                 self.isBusy = false
                 self.isTearingDown = false
+                self.shareQueueWedged = true
                 self.transitionGeneration &+= 1
-                self.healCount += 1
-                if self.healCount > 3 {
-                    self.healsExhausted = true
-                    self.userNotice = "System audio sharing keeps getting stuck. Restart the app."
-                    FileLog.log("share: heal budget exhausted (\(self.healCount) heals); latching restart-required")
-                    return
-                }
-                // Swap the abandoned queue. Its worker is parked forever;
-                // the leak budget is one DispatchQueue + one parked thread
-                // + at most one engine per wedge, capped at three per
-                // incident. The generation suffix makes the abandoned
-                // queue attributable in spindumps.
-                self.shareQueue = DispatchQueue(label: "dev.zackslash.Szept.share.g\(self.transitionGeneration)",
-                                                qos: .userInitiated)
-                // Reset the wedged session state. SAFE per the
-                // never-last-reference invariant: main's currentEngine
-                // reference is never the last reference while a transition
-                // is in flight (the operating worker's frame holds one),
-                // so niling it here does not run a dealloc on main.
-                self.currentEngine = nil
-                self.multiOutputID = nil
-                self.memberDeviceID = nil
-                self.armedRenderRate = nil
-                self.enabledAt = nil
-                // A wedged enable leaves the bus armed with a dead capture.
-                self.mixBus.disarm()
-                self.userNotice = "System audio sharing hit a snag and reset itself. Try sharing again."
-                // HAL cleanup on the FRESH queue (I5: never on main).
-                let mic = self.micProcessor
-                let q = self.shareQueue
-                q.async { self.healCleanup(mic: mic) }
+                self.userNotice = "System audio sharing hit a snag and stopped. Everything else is unaffected; sharing returns when you restart the app."
             }
         }
         if Thread.isMainThread { arm() } else { DispatchQueue.main.sync { arm() } }
-    }
-
-    /// Post-heal HAL cleanup. Runs on the FRESH share queue (never main:
-    /// HAL mutations, invariant I5), so enables serialize behind this
-    /// block on the serial queue.
-    private func healCleanup(mic: MicProcessor?) {
-        // A wedged enable may have left the multi-output as the system
-        // default. Invariant I1: stop the mic engine FIRST (zero live
-        // clients before destroy), then restore BEFORE destroy, mirroring
-        // performTeardown's ordering.
-        if AudioDeviceManager.defaultOutputDeviceUID() == Self.multiOutputUID {
-            if mic?.isRunning == true {
-                FileLog.log("share: [heal] stopping mic engine before multi-output destroy (park-capable)")
-                mic?.stop()
-            }
-            Self.restorePreviousOutputFromDefaults()
-        }
-        // Tolerant sweep; a benign double-destroy race with the old
-        // worker's own eventual rollback is fine.
-        AudioDeviceManager.findAndDestroyStaleShareMultiOutput()
-        // A wedged disable-side teardown must not leave the mic dead.
-        DispatchQueue.main.async {
-            if mic?.isRunning == false {
-                self.restartMicAfterShareTeardown?()
-            }
-        }
-        // Restamp the cooldown clock: the next enable sleeps out the
-        // post-teardown window behind this block (queue confinement).
-        lastTeardownCompletedAt = Date()
     }
 
     // MARK: - External change handling
