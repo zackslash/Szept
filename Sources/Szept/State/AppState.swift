@@ -17,6 +17,12 @@ final class AppState {
 
     init() {
         micProcessor = MicProcessor(systemMixBus: systemSharer.mixBus)
+        // A share teardown that had to stop the mic engine (invariant I1:
+        // stop clients before destroying the multi-output) asks us to bring
+        // it back through the same retrying start path as everything else.
+        systemSharer.restartMicAfterShareTeardown = { [weak self] in
+            self?.startEngineWithRetry(reason: "share teardown")
+        }
     }
 
     // MARK: - System audio sharing
@@ -44,7 +50,7 @@ final class AppState {
             }
         } else {
             guard systemSharer.isSharing else { return }
-            systemSharer.disable()
+            systemSharer.disable(restartMic: true)
             lastError = nil
         }
     }
@@ -138,10 +144,11 @@ final class AppState {
                     FileLog.log("\(reason): start failed after retry: \(error.localizedDescription) (domain \(ns.domain), code \(ns.code))")
                     self.lastError = EngineStartError.message(for: error)
                     // Share cannot outlive a dead engine: same rule as the
-                    // engine-off path. The user re-toggles share after
-                    // recovery, same as post-sleep.
+                    // engine-off path. restartMic=false: the engine just
+                    // failed for its own reasons; no restart loop. The user
+                    // re-toggles share after recovery, same as post-sleep.
                     if self.systemSharer.isSharing {
-                        self.systemSharer.disable()
+                        self.systemSharer.disable(restartMic: false)
                     }
                 }
             }
@@ -167,7 +174,7 @@ final class AppState {
            (micProcessor.renderSampleRate != systemSharer.armedRenderRate
                && micProcessor.renderSampleRate != nil)
                || systemSharer.memberDeviceID == micProcessor.outputDeviceID {
-            systemSharer.disable()
+            systemSharer.disable(restartMic: false)
             do { try systemSharer.enable(micProcessor: micProcessor) }
             catch { lastError = error.localizedDescription }
         }

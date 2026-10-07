@@ -78,7 +78,7 @@ final class MicProcessor {
     // resolve, a private aggregate (input as clock master) carries the
     // output instead; any aggregate failure falls back to direct BlackHole
     // routing and never fails a start.
-    private var aggregateDeviceID: AudioDeviceID?
+    private(set) var aggregateDeviceID: AudioDeviceID?
     // Offset of the BlackHole member's channels within the aggregate's
     // output channel list (the input sub-device's own output count).
     private var aggregateChannelOffset: UInt32 = 0
@@ -116,6 +116,15 @@ final class MicProcessor {
     // feeds the target device from a ring buffer filled by the tap. The
     // engine's device pin is deliberately NOT set: if it ever stuck, the
     // engine would write digital zeros into BlackHole alongside our voice.
+    //
+    // Invariant I1 (deadlock): because the engine is unpinned, its muted
+    // output unit is an implicit HAL client of whatever the CURRENT DEFAULT
+    // output is. While system-audio sharing is on, that default is the share
+    // multi-output; the share teardown therefore stops THIS engine BEFORE
+    // destroying the multi-output (see SystemAudioSharer.
+    // teardownCapturedDevices), because destroying a device that an audio
+    // unit still references can deadlock main in AVAudioEngine dealloc
+    // against a wedged HAL plugin (reproduced on macOS 26.2).
 
     private var outputUnit: AudioComponentInstance?
     private var ring: UnsafeMutablePointer<Float>?

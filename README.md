@@ -10,12 +10,12 @@ Input device -> AUSoundIsolation -> BlackHole -> call app
 ## Requirements
 
 - macOS 14 or newer, Apple Silicon
-- BlackHole 2ch, installed separately (GPL-3, not bundled)
+- BlackHole 2ch and 16ch, installed separately (GPL-3, not bundled)
 - Swift 6 toolchain: Xcode 16 or newer, or Command Line Tools
 
 ## Installing BlackHole
 
-    brew install --cask blackhole-2ch
+    brew install --cask blackhole-2ch blackhole-16ch
 
 Reboot after installing, or run sudo killall coreaudiod. Without Homebrew,
 install the pkg from https://existential.audio and reboot.
@@ -42,10 +42,10 @@ access when prompted.
 2. Call app: microphone set to BlackHole 2ch, its own noise suppression
    off.
 3. Strength is a fixed choice: Gentle, Medium, or Max.
-4. Share system audio (per session): needs BlackHole 16ch (brew install
-   --cask blackhole-16ch). Toggle from the menu; never persists across
-   launches. Point the call app's speakers at your real output to avoid
-   echo.
+4. Share system audio (per session): needs a second BlackHole besides the
+   mic-output one (both are installed by the brew line above). Toggle from
+   the menu; never persists across launches. Point the call app's speakers
+   at your real output to avoid echo.
 
 Hotkeys: ctrl+opt+N start or stop, ctrl+opt+C cycle clarity, ctrl+opt+[
 and ctrl+opt+] strength, ctrl+opt+B hold to bypass, ctrl+opt+S share

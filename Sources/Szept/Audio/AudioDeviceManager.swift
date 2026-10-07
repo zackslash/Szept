@@ -73,6 +73,47 @@ final class AudioDeviceManager {
         return devices
     }
 
+    /// Raw device IDs from kAudioHardwarePropertyDevices ONLY: no per-device
+    /// property reads, so it is cheap and cannot be poisoned by a dead
+    /// device. Used by the lifecycle observer's device-list diff.
+    static func allDeviceIDs() throws -> [AudioDeviceID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size
+        )
+        guard status == noErr else { throw AudioDeviceError.queryFailed(status) }
+
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        guard count > 0 else { return [] }
+
+        let buffer = UnsafeMutableBufferPointer<AudioDeviceID>.allocate(capacity: count)
+        defer { buffer.deallocate() }
+        guard let pointer = buffer.baseAddress else { return [] }
+
+        status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, pointer
+        )
+        guard status == noErr else { throw AudioDeviceError.queryFailed(status) }
+
+        var deviceIDs: [AudioDeviceID] = []
+        deviceIDs.reserveCapacity(Int(size) / MemoryLayout<AudioDeviceID>.size)
+        for i in 0..<(Int(size) / MemoryLayout<AudioDeviceID>.size) {
+            deviceIDs.append(pointer[i])
+        }
+        return deviceIDs
+    }
+
+    /// Best-effort device name for a single device; nil when the device is
+    /// dead or any property read fails. Never throws.
+    static func deviceName(deviceID: AudioDeviceID) -> String? {
+        try? stringProperty(selector: kAudioObjectPropertyName, deviceID: deviceID)
+    }
+
     static func inputDevices() throws -> [AudioDeviceInfo] {
         // Our own aggregates and the share multi-output never belong in a
         // user-facing picker.

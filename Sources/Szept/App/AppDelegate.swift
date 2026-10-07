@@ -95,9 +95,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Sharer first: it must restore the default output and destroy the
-        // multi-output while the mic engine is still alive.
-        appState.systemSharer.disable()
+        // Sharer teardown FIRST: it restores the default output and stops
+        // the mic engine itself (invariant I1: mic engine stops before the
+        // multi-output is destroyed), in the safe order. The second stop is
+        // idempotent.
+        appState.systemSharer.disable(restartMic: false)
         appState.micProcessor.stop()
     }
 
