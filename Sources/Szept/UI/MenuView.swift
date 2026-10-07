@@ -101,6 +101,7 @@ struct MenuView: View {
                 }
                 .buttonStyle(.borderless)
                 .contentShape(Rectangle())
+                .disabled(!appState.micProcessor.isRunning || appState.systemSharer.isBusy)
                 Button("Quit") {
                     NSApp.terminate(nil)
                 }

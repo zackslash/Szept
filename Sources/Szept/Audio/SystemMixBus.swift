@@ -50,7 +50,8 @@ final class SystemMixBus {
 
     var isActive: Bool { active }
 
-    /// Main thread. Allocate the ring on first use and reset the bridge.
+    /// Called on the share queue (enable's arm step). Allocate the ring on
+    /// first use and reset the bridge.
     /// `inputRate` is the capture tap rate (BlackHole, pinned to 48 kHz by
     /// the sharer), `outputRate` the mic engine's render rate.
     func arm(inputRate: Double, outputRate: Double) {
@@ -67,8 +68,13 @@ final class SystemMixBus {
         active = true
     }
 
-    /// Main thread. Stop mixing; the ring is intentionally NOT freed or
+    /// Called on main (disable's entry and the watchdog's fired path) and
+    /// on the share queue (enable rollback). Stop mixing; the ring is
+    /// intentionally NOT freed or
     /// reset so the render thread can never observe a dangling pointer.
+    /// Safe off-main: single-word store with a barrier, render-side
+    /// effects gated by isActive, and transitions are serialized by the
+    /// sharer's isBusy window.
     func disarm() {
         active = false
         OSMemoryBarrier()

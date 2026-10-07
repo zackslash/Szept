@@ -81,6 +81,14 @@ enum AppAction {
     // MARK: - Actions
 
     private func toggleEngine(on appState: AppState) {
+        // Belt-and-braces gate for the hotkey/URL paths (the MenuView
+        // button is already disabled): a share transition in flight stops
+        // the mic engine itself (I1), so a concurrent engine toggle would
+        // interleave with it.
+        guard !appState.systemSharer.isBusy else {
+            FileLog.log("engine: toggle ignored, share transition in progress")
+            return
+        }
         let defaults = UserDefaults.standard
         if appState.micProcessor.isRunning {
             // Sharer teardown BEFORE the mic stop: it stops the mic engine

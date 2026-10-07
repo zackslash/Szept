@@ -107,6 +107,15 @@ final class MicProcessor {
     private var isolationUnit: AVAudioUnitEffect?
     private let logger = Logger(subsystem: "dev.zackslash.Szept", category: "MicProcessor")
 
+    /// Serializes start()/stop() against each other. The share teardown
+    /// stops this engine from the sharer's worker queue (invariant I1),
+    /// while stop()/start() also run on main (toggleEngine, wake rebuild,
+    /// terminate); without the lock the engine/outputUnit/isRunning
+    /// mutation sections could interleave across threads. NSLock (not
+    /// recursive): start()'s internal failure path calls the UNLOCKED
+    /// stopLocked(), never stop().
+    private let lifecycleLock = NSLock()
+
     // MARK: - Dedicated output unit (owned by us, invisible to the engine)
     //
     // AVAudioEngine owns its output unit's device selection and resets it
@@ -121,9 +130,9 @@ final class MicProcessor {
     // output unit is an implicit HAL client of whatever the CURRENT DEFAULT
     // output is. While system-audio sharing is on, that default is the share
     // multi-output; the share teardown therefore stops THIS engine BEFORE
-    // destroying the multi-output (see SystemAudioSharer.
-    // teardownCapturedDevices), because destroying a device that an audio
-    // unit still references can deadlock main in AVAudioEngine dealloc
+    // destroying the multi-output (see SystemAudioSharer.performTeardown),
+    // because destroying a device that an audio unit still references can
+    // deadlock main in AVAudioEngine dealloc
     // against a wedged HAL plugin (reproduced on macOS 26.2).
 
     private var outputUnit: AudioComponentInstance?
@@ -147,6 +156,15 @@ final class MicProcessor {
     // MARK: - Lifecycle
 
     func start() throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        try startLocked()
+    }
+
+    /// start() body; caller holds lifecycleLock. The sharer's queue-side
+    /// stop (I1 teardown) can no longer interleave with this section's
+    /// engine/outputUnit/isRunning mutations.
+    private func startLocked() throws {
         guard !isRunning else { return }
 
         FileLog.log("start: beginning")
@@ -197,12 +215,15 @@ final class MicProcessor {
         // LATENT HANG PATTERN (same family as share hang #2): this read
         // dispatch_syncs onto the IO unit's queue, so it parks if a device
         // reconfiguration triggered by an earlier pin in the same call is
-        // still in flight. Census (round 3): this read and the :150 engine
-        // release are the LAST main-thread park-capable sites in the app
-        // (both on the post-teardown mic restart path). Justified because
-        // the mic input is never rate-mutated within the same call and
-        // rebuilds are debounce-settled >= 1s. Revisit if a BlackHole
-        // becomes pinnable as mic input or a retest ever parks here.
+        // still in flight. Census: main-thread park-capable sites are this
+        // read, the engine = AVAudioEngine() re-assignment in start(), and
+        // stop()'s engine/AU teardown (stop() itself runs on main from
+        // toggleEngine/terminate AND from the sharer's queue, where the
+        // lock serializes it against main). Pre-existing and bounded: the
+        // debounce settles rebuilds >= 1s and the I1 ordering keeps the
+        // multi-output alive until the mic is stopped. Revisit if a
+        // BlackHole becomes pinnable as mic input or a retest ever parks
+        // here.
         guard inputFormat.sampleRate > 0 else {
             FileLog.log("start: invalid input format")
             destroyAggregateIfNeeded()
@@ -260,7 +281,7 @@ final class MicProcessor {
             try startOutputUnit(sampleRate: inputFormat.sampleRate)
         } catch {
             FileLog.log("start: output unit failed: \(error.localizedDescription)")
-            stop()
+            stopLocked()
             throw error
         }
         FileLog.log("start: complete, output unit running")
@@ -279,8 +300,15 @@ final class MicProcessor {
     }
 
     func stop() {
-        // Idempotent: also callable from the start-failure path, where
-        // isRunning is still false but a live engine must be torn down.
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        stopLocked()
+    }
+
+    /// stop() body; caller holds lifecycleLock. Idempotent: also callable
+    /// from the start-failure path, where isRunning is still false but a
+    /// live engine must be torn down.
+    private func stopLocked() {
         FileLog.log("stop: tearing down (isRunning=\(isRunning))")
 
         stopOutputUnit()

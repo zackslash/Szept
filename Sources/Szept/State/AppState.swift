@@ -185,25 +185,25 @@ final class AppState {
         // (the rebuilt private aggregate around the same BlackHole the
         // multi-output contains) is the other forbidden state, so it forces
         // a re-enable too. The sharer's create/destroy is filtered from the
-        // observer's snapshots, so the pair cannot trigger a rebuild.
+        // observer's snapshots, so the re-enable cannot trigger a rebuild.
         if systemSharer.isSharing,
            (micProcessor.renderSampleRate != systemSharer.armedRenderRate
                && micProcessor.renderSampleRate != nil)
                || systemSharer.memberDeviceID == micProcessor.outputDeviceID {
-            // Async re-enable (invariant I5): the sharer's engine/HAL work
-            // runs on its worker queue, so the disable+enable pair is
-            // dispatched as a Task; attempt() no longer blocks on it. The
-            // sharer's own isBusy/transition-generation guard keeps the
-            // pair serialized against user toggles.
+            // Sequenced re-enable: the sharer-internal reenable() runs the
+            // disable and the fresh enable inside ONE isBusy window on its
+            // worker queue. A naive await-disable-then-try-enable pair
+            // here is broken: disable returns at the shareQueue dispatch
+            // with isBusy still true, so the enable is silently dropped by
+            // the busy guard and the mic is left stopped.
             FileLog.log("share: re-enable dispatched post-restart")
             Task { [weak self] in
                 guard let self else { return }
-                await self.systemSharer.disable(restartMic: false)
                 do {
-                    try await self.systemSharer.enable(micProcessor: self.micProcessor)
+                    try await self.systemSharer.reenable(micProcessor: self.micProcessor)
                     await MainActor.run { self.lastError = nil }
                 } catch {
-                    FileLog.log("share: enable error surfaced: \(error.localizedDescription)")
+                    FileLog.log("share: re-enable error surfaced: \(error.localizedDescription)")
                     await MainActor.run { self.lastError = error.localizedDescription }
                 }
             }

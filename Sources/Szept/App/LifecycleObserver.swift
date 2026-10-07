@@ -183,13 +183,6 @@ final class LifecycleObserver {
         observerTokens.append(token)
     }
 
-    // External device IDs as of the last accepted device-list state, with
-    // our own aggregate and share multi-output excluded by created-ID (see
-    // filteredDeviceIDs). Our own device create/destroy calls fire this
-    // same listener; comparing filtered ID sets keeps them invisible to the
-    // rebuild logic so they cannot trigger a stop/start churn loop.
-    // (lastStableDeviceIDs/pendingDeviceIDs are declared near the top.)
-
     /// Coarse HAL signal that the device list changed (USB blip, coreaudiod
     /// restart). Routed through the same debounced rebuild as the engine
     /// notification so a burst of events causes one rebuild, not many.
