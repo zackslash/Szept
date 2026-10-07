@@ -58,6 +58,10 @@ final class SystemAudioSharer {
     /// next UI toggle surfaces it via lastError.
     private(set) var userNotice: String?
 
+    /// Main thread. AppState consumes a stuck-transition notice into its
+    /// error banner; only the sharer itself ever sets the value.
+    func clearUserNotice() { userNotice = nil }
+
     /// True between the start and end of a teardown, so a re-entrant
     /// enable() or disable() cannot interleave with one in progress.
     private var isTearingDown = false

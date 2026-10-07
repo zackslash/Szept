@@ -43,7 +43,7 @@ final class AppState {
         // Surface a watchdog notice from a previous stuck transition.
         if let notice = systemSharer.userNotice {
             lastError = notice
-            systemSharer.userNotice = nil
+            systemSharer.clearUserNotice()
         }
         if on {
             // Sharing requires the mic pipeline to be up: the mix bus is
