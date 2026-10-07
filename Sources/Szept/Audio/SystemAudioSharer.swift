@@ -826,9 +826,15 @@ final class SystemAudioSharer {
         // guard, the code-38 retry's legitimate ~10s path (4s probe cap +
         // 2s settle + second attempt) would false-wedge when the FIRST
         // arm's +8s timer fired mid-retry.
-        DispatchQueue.main.sync {
-            self.watchdogEpoch += 1
-            let epoch = self.watchdogEpoch
+        //
+        // Called from BOTH the share queue (performEnable, retry arms) and
+        // main (disable's @MainActor entry). dispatch_sync onto a queue the
+        // calling thread already owns is an immediate SIGTRAP, so the main
+        // hop must be conditional - unconditional main.sync here was the
+        // round-5 crash loop (one trap per share-off toggle).
+        func arm() {
+            watchdogEpoch += 1
+            let epoch = watchdogEpoch
             DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
                 guard let self else { return }
                 guard epoch == self.watchdogEpoch, self.isBusy,
@@ -842,6 +848,7 @@ final class SystemAudioSharer {
                 self.userNotice = "System audio sharing got stuck. Toggle again or restart the app."
             }
         }
+        if Thread.isMainThread { arm() } else { DispatchQueue.main.sync { arm() } }
     }
 
     // MARK: - External change handling
