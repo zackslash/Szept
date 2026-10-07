@@ -575,8 +575,15 @@ final class SystemAudioSharer {
             channels = 2
             source = "fallback"
         }
-        FileLog.log("share: [fmt] wiring \(Int(rate)) Hz, \(channels) ch (\(source))")
-        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: rate, channels: AVAudioChannelCount(channels)) else {
+        // Cap the WIRING format at 2ch: the tap consumes only ptrs[0]/ptrs[1]
+        // (system stereo), and macOS 26.2 refuses to construct >2ch standard
+        // float formats at all - AVAudioFormat(standardFormatWithSampleRate:
+        // channels: 16) returns nil (verified live on the test Mac; the
+        // hand-built ASBD route is nil too). The engine inserts a converter
+        // from the device's full channel count; capture loses nothing.
+        let wireChannels = min(channels, 2)
+        FileLog.log("share: [fmt] wiring \(Int(rate)) Hz, \(wireChannels) ch from \(channels) ch (\(source))")
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: rate, channels: AVAudioChannelCount(wireChannels)) else {
             throw NSError(domain: "Szept", code: 36,
                           userInfo: [NSLocalizedDescriptionKey: "Could not build the capture wiring format"])
         }
