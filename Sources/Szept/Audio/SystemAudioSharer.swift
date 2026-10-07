@@ -42,6 +42,14 @@ import CoreAudio
 /// path performs a REAL quiet rollback (engine stop, multi-output destroy,
 /// state clear) and clears the wedge latch, so a worker that eventually
 /// unparks leaves the sharer usable instead of stuck-restart-only.
+///
+/// Prevention layer (as of round 4): hang #4 was an apply-class park -
+/// connect(format:) applying a client format onto MID-UNSTACK state (the
+/// BlackHole still reconfiguring +2s after a teardown; observable symptom:
+/// the input-scope ASBD reads 1ch when healthy is 2ch). The full stack is:
+/// post-teardown cooldown -> rate-settle wait -> pin -> input-ASBD
+/// stability probe -> explicit client formats. Containment is unchanged:
+/// worker queue + 8s watchdog + stale gates + wedge hygiene.
 @Observable
 final class SystemAudioSharer {
 
@@ -81,6 +89,12 @@ final class SystemAudioSharer {
     /// published flip from the queue is guarded by generation equality.
     private var transitionGeneration = 0
 
+    /// When the last performTeardown returned. Enables sleep out a cooldown
+    /// from this stamp: every observed park (hangs #3, #4) was an engine
+    /// touch 2-5s after teardown unstack churn. Queue-confined.
+    private var lastTeardownCompletedAt: Date?
+    private static let postTeardownCooldown: TimeInterval = 3.0
+
     /// The live capture engine, recreated FRESH per enable (AVAudioEngine
     /// restart-after-stop is flaky). Exposed so the lifecycle observer can
     /// match a configuration-change notification by object identity.
@@ -113,8 +127,9 @@ final class SystemAudioSharer {
     // MARK: - Enable
 
     /// Ordered enable with full rollback on any failure. Main-thread entry:
-    /// validates state, publishes isBusy, arms the watchdog, and dispatches
-    /// the real work to shareQueue (invariant I5). The capture engine is
+    /// validates state, publishes isBusy, and dispatches the real work to
+    /// shareQueue (invariant I5); the watchdog is armed inside the worker
+    /// after its bounded cooldown. The capture engine is
     /// built and started BEFORE the multi-output exists, pinned to the
     /// STANDALONE BlackHole device, so the engine never has a reference to
     /// a device being created/destroyed under it:
@@ -145,7 +160,8 @@ final class SystemAudioSharer {
         isBusy = true
         transitionGeneration &+= 1
         let gen = transitionGeneration
-        armWatchdog(gen)
+        // The watchdog is armed inside performEnable, after the cooldown:
+        // it supervises real work only.
         shareQueue.async { self.performEnable(gen, micProcessor) }
     }
 
@@ -159,6 +175,31 @@ final class SystemAudioSharer {
         var multiOutputID: AudioDeviceID?
         var memberDeviceID: AudioDeviceID?
         var defaultFlipped = false
+
+        // Cooldown FIRST, step label "cooldown": every observed park
+        // (hangs #3, #4) was an engine touch 2-5s after teardown unstack
+        // churn, so sleep out the remainder of the window before touching
+        // anything. The sleep is invisible to main; isBusy already holds
+        // the UI. 3.0 (not 2.5) covers the async mic-rebuild churn that
+        // lands after the stamp: restartMicAfterShareTeardown is dispatched
+        // at teardown end, so the rebuild's own engine/HAL work trails the
+        // timestamp.
+        step = "cooldown"
+        if let stamp = lastTeardownCompletedAt {
+            let elapsed = Date().timeIntervalSince(stamp)
+            let cooldown = Self.postTeardownCooldown
+            if elapsed < cooldown {
+                let waitMs = Int((cooldown - elapsed) * 1000)
+                FileLog.log("share: [cooldown] waiting \(waitMs)ms post-teardown (HAL settling)")
+                usleep(useconds_t(waitMs * 1000))
+            }
+        }
+
+        // Arm the watchdog AFTER the cooldown: it supervises real work
+        // only; dead time (cooldown) is bounded by construction - a false
+        // wedge costs an app restart and must be impossible.
+        armWatchdog(gen)
+
         do {
             // Suppression FIRST, before any default-output flip this call
             // may trigger (including the stale-cleanup restore in step 3):
@@ -356,6 +397,57 @@ final class SystemAudioSharer {
         finishTransition()
     }
 
+    /// Park-safety gate for the connect: wait until the device's input ASBD
+    /// is sane AND stable before a client format is applied onto it (hang
+    /// #4 was an apply-class park onto mid-unstack state; the phantom 1ch
+    /// read is the observable symptom). Primary reads go through
+    /// AudioDeviceManager.inputStreamFormat (device-object, park-safe).
+    /// The first sane >=2ch read is trusted outright (three rounds of
+    /// telemetry showed healthy devices answering 2ch on the first try);
+    /// otherwise re-read every 100ms up to 1.5s, accepting two consecutive
+    /// identical sane reads (preferring a >=2ch stable read over an earlier
+    /// 1ch-stable one if it arrives within the cap). At cap expiry the last
+    /// stable sane read is accepted even if 1ch (custom BlackHole builds
+    /// exist; the tap's mono branch handles it) - probe-on-suspicion, never
+    /// block forever waiting for 2ch. Returns nil only if nothing sane was
+    /// ever read (the caller falls to the helpers/hardcode ladder).
+    private func probeStableInputFormat(deviceID: AudioDeviceID) -> (asbd: AudioStreamBasicDescription, source: String)? {
+        func read() -> AudioStreamBasicDescription? {
+            AudioDeviceManager.inputStreamFormat(deviceID: deviceID)
+        }
+        // Fast path: healthy devices answer sane 2ch on the first read.
+        if let first = read(), first.mChannelsPerFrame >= 2 {
+            return (first, "device ASBD")
+        }
+
+        var previous: AudioStreamBasicDescription?
+        var bestStable: AudioStreamBasicDescription?
+        var waitedMs = 0
+        while waitedMs < 1500 {
+            usleep(100_000)
+            waitedMs += 100
+            guard let current = read() else { previous = nil; continue }
+            if let prev = previous, prev.mSampleRate == current.mSampleRate,
+               prev.mChannelsPerFrame == current.mChannelsPerFrame {
+                // Two consecutive identical sane reads: stable.
+                if current.mChannelsPerFrame >= 2 {
+                    FileLog.log("share: [fmt] probe waited \(waitedMs)ms, stabilized \(Int(current.mSampleRate)) Hz \(current.mChannelsPerFrame) ch")
+                    return (current, "device ASBD (stabilized)")
+                }
+                // 1ch-stable: remember it, keep probing for 2ch until the cap.
+                if bestStable == nil {
+                    bestStable = current
+                }
+            }
+            previous = current
+        }
+        if let stable = bestStable {
+            FileLog.log("share: [fmt] probe cap reached, using last stable \(Int(stable.mSampleRate)) Hz \(stable.mChannelsPerFrame) ch")
+            return (stable, "device ASBD (cap, mono)")
+        }
+        return nil
+    }
+
     /// Build, pin, wire, and start the share capture engine. Runs on
     /// shareQueue. Every park-capable call is bracketed with FileLog lines
     /// so a post-mortem shows exactly which call parked. Returns the
@@ -416,15 +508,21 @@ final class SystemAudioSharer {
         // engine-inserted sample-rate/channel converter, never by a node
         // query.
         //
-        // Format ladder:
-        let asbd = AudioDeviceManager.inputStreamFormat(deviceID: blackHoleID)
+        // Format ladder. PRIMARY RUNG: the stability probe - it gates the
+        // client-format application below until the device's input ASBD is
+        // sane and stable (park class of hang #4: applying a format onto
+        // mid-unstack state, observable as a phantom 1ch ASBD read).
+        // Probe-on-suspicion, never block forever waiting for 2ch. The
+        // helper and hardcode rungs stay single-shot behind the probe (used
+        // only when the probe returns nil, i.e. nothing sane was ever
+        // read).
         var rate: Double
         var channels: Int
         var source: String
-        if let asbd {
-            rate = asbd.mSampleRate
-            channels = Int(asbd.mChannelsPerFrame)
-            source = "device ASBD"
+        if let probed = probeStableInputFormat(deviceID: blackHoleID) {
+            rate = probed.asbd.mSampleRate
+            channels = Int(probed.asbd.mChannelsPerFrame)
+            source = probed.source
         } else if let nominal = AudioDeviceManager.nominalSampleRate(deviceID: blackHoleID) {
             rate = nominal
             channels = max(2, AudioDeviceManager.inputChannelCount(deviceID: blackHoleID))
@@ -523,6 +621,13 @@ final class SystemAudioSharer {
         // race a newer session - restartMic is skipped. While wedged, no
         // newer session can exist (enable refuses), so there is nothing to
         // race unless the wedge was already cleared.
+        //
+        // Asymmetry note: teardown ops are reader-side wind-down
+        // (removeTap/stop/release/dispose) plus device-object sets
+        // (restore/destroy); they were never observed to park across three
+        // rounds. The park class is WRITER-side format application
+        // (startCaptureEngine only). Revisit if any teardown bracket ever
+        // parks.
         let stale = isStale(gen)
         if stale {
             FileLog.log("share: stale worker returned (gen \(gen)); disable teardown runs restoratively, no mic restart")
@@ -608,6 +713,11 @@ final class SystemAudioSharer {
                 self.restartMicAfterShareTeardown?()
             }
         }
+
+        // 8. Stamp teardown completion (queue-confined: written and read
+        // only on shareQueue, no hops; performEnable's cooldown sleeps on
+        // the same queue, so the handoff is naturally ordered).
+        lastTeardownCompletedAt = Date()
     }
 
     /// Stop and discard a half-built engine from a failed start attempt
