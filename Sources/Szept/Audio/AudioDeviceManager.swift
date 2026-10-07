@@ -475,4 +475,28 @@ final class AudioDeviceManager {
     static func inputChannelCount(deviceID: AudioDeviceID) -> Int {
         (try? channelCount(deviceID: deviceID, scope: kAudioObjectPropertyScopeInput)) ?? 0
     }
+
+    /// The device's INPUT-scope stream format, read from the DEVICE object.
+    /// Park-safety: AudioObjectGetPropertyData on a device object talks to
+    /// coreaudiod directly (same class as nominalSampleRate/allDevices;
+    /// never observed to park). Do NOT substitute
+    /// kAudioUnitProperty_StreamFormat on the input AU - that routes
+    /// through the unit's internal serialization, the hang-2/hang-3 park
+    /// class. Returns nil on any error or insane ASBD.
+    static func inputStreamFormat(deviceID: AudioDeviceID) -> AudioStreamBasicDescription? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioObjectGetPropertyData(
+            deviceID, &address, 0, nil, &size, &asbd
+        )
+        guard status == noErr else { return nil }
+        guard (8_000.0...192_000.0).contains(asbd.mSampleRate),
+              (1...64).contains(asbd.mChannelsPerFrame) else { return nil }
+        return asbd
+    }
 }

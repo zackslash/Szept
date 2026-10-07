@@ -30,8 +30,18 @@ import CoreAudio
 /// dedicated worker queue (shareQueue), main only publishes state, and an
 /// 8s watchdog converts a parked worker into a "stuck" state (code 37) the
 /// user can recover from by restarting, instead of a hung app. Prevention
-/// (nil formats, rate-settle waits) shrinks the park window; the watchdog
-/// contains the rest.
+/// shrinks the park window; the watchdog contains the rest.
+///
+/// Prevention layer (as of round 3): ZERO node-format queries anywhere on
+/// the enable path. hang #2 was outputFormat(forBus:), hang #3 was
+/// connect(format: nil) resolving the input node's HW format - both are
+/// the same GetClientFormat sync through the unit's internal
+/// serialization. All wiring formats are pre-built from park-safe
+/// device-object HAL reads (see AudioDeviceManager.inputStreamFormat); a
+/// mismatch is absorbed by an engine-inserted converter. The stale-worker
+/// path performs a REAL quiet rollback (engine stop, multi-output destroy,
+/// state clear) and clears the wedge latch, so a worker that eventually
+/// unparks leaves the sharer usable instead of stuck-restart-only.
 @Observable
 final class SystemAudioSharer {
 
@@ -119,6 +129,7 @@ final class SystemAudioSharer {
     func enable(micProcessor: MicProcessor) async throws {
         guard !isSharing else { return }
         if shareQueueWedged {
+            FileLog.log("share: enable refused, share queue wedged (app restart required)")
             throw NSError(domain: "Szept", code: 37,
                           userInfo: [NSLocalizedDescriptionKey: "Sharing is stuck. Restart the app."])
         }
@@ -258,6 +269,11 @@ final class SystemAudioSharer {
             publishIfCurrent(gen) { self.enabledAt = Date() }
             _ = engine
 
+            // STALE GATE 1: the watchdog may have abandoned this worker
+            // while the engine start parked. Before creating anything new,
+            // roll back quietly with the local state.
+            if isStale(gen) { return rollbackStaleWorker(gen: gen, step: step, defaultFlipped: defaultFlipped, multiOutputID: multiOutputID, memberDeviceID: memberDeviceID) }
+
             step = "create multi-output"
             // 5. Multi-output: previous default (the speakers) as clock
             // master and app-facing format, BlackHole as drift-compensated
@@ -279,6 +295,10 @@ final class SystemAudioSharer {
                 self.multiOutputID = createdID
                 self.memberDeviceID = capturedMember
             }
+
+            // STALE GATE 2: the default flip is the irreversible step - a
+            // worker the watchdog already abandoned must never perform it.
+            if isStale(gen) { return rollbackStaleWorker(gen: gen, step: step, defaultFlipped: defaultFlipped, multiOutputID: multiOutputID, memberDeviceID: memberDeviceID) }
 
             step = "flip default output"
             // 6. Suppression window again: flipping the default output makes
@@ -315,6 +335,24 @@ final class SystemAudioSharer {
                 }
             }
         }
+        finishTransition()
+    }
+
+    /// Quiet rollback for a stale (watchdog-abandoned) enable worker that
+    /// eventually returned: tear down with the LOCAL state, clear the wedge
+    /// latch, clear the transition flags, and flip nothing. Runs on
+    /// shareQueue; called by the stale gates (returns from performEnable).
+    private func rollbackStaleWorker(gen: Int, step: String, defaultFlipped: Bool,
+                                     multiOutputID: AudioDeviceID?,
+                                     memberDeviceID: AudioDeviceID?) {
+        FileLog.log("share: stale worker returned (gen \(gen)); rolling back quietly (step was: \(step))")
+        performTeardown(
+            gen: gen, reason: "stale rollback",
+            restartMic: true, cycleMic: defaultFlipped,
+            engine: currentEngineSnapshot(),
+            multiOutputID: multiOutputID, memberDeviceID: memberDeviceID
+        )
+        clearWedgeIfStale(gen)
         finishTransition()
     }
 
@@ -366,22 +404,52 @@ final class SystemAudioSharer {
 
         // Never an empty graph: input -> muted mixer -> output, so the
         // engine has a complete pull chain and only the tap consumes
-        // the audio. NIL FORMATS everywhere: reading
-        // inputNode.outputFormat(forBus: 0) here was hang #2 (it
-        // dispatch_syncs onto the IO unit's queue, which the pin's
-        // reconfiguration can still hold). Passing nil lets the engine
-        // resolve formats internally. Caveat: the internal resolution of
-        // connect(format: nil)/installTap(format: nil) is undocumented and
-        // not a guarantee; if a future macOS breaks it, the fallback is a
-        // post-start format read on the queue, never a pre-pin read.
-        FileLog.log("share: [start capture engine] connecting graph, nil formats (park-capable)")
-        engine.connect(inputNode, to: engine.mainMixerNode, format: nil)
-        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
-        engine.mainMixerNode.outputVolume = 0
-        FileLog.log("share: [start capture engine] graph connected")
+        // the audio. NIL FORMATS ARE RETIRED: connect(format: nil) on the
+        // input side resolves the SOURCE node's HW format internally -
+        // the same GetClientFormat dispatch_sync that was hang #2
+        // (outputFormat(forBus:)); hang #3 (12:38:41) bracket-confirmed
+        // this connect as the park. Formats are therefore PRE-BUILT here
+        // from park-safe device-object HAL reads (inputStreamFormat /
+        // nominalSampleRate / inputChannelCount, all coreaudiod
+        // round-trips, never unit queries); any mismatch between the
+        // wiring format and the node's real HW format is absorbed by an
+        // engine-inserted sample-rate/channel converter, never by a node
+        // query.
+        //
+        // Format ladder:
+        let asbd = AudioDeviceManager.inputStreamFormat(deviceID: blackHoleID)
+        var rate: Double
+        var channels: Int
+        var source: String
+        if let asbd {
+            rate = asbd.mSampleRate
+            channels = Int(asbd.mChannelsPerFrame)
+            source = "device ASBD"
+        } else if let nominal = AudioDeviceManager.nominalSampleRate(deviceID: blackHoleID) {
+            rate = nominal
+            channels = max(2, AudioDeviceManager.inputChannelCount(deviceID: blackHoleID))
+            source = "device helpers"
+        } else {
+            rate = 48000
+            channels = 2
+            source = "fallback"
+        }
+        FileLog.log("share: [fmt] wiring \(Int(rate)) Hz, \(channels) ch (\(source))")
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: rate, channels: AVAudioChannelCount(channels)) else {
+            throw NSError(domain: "Szept", code: 36,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not build the capture wiring format"])
+        }
 
-        FileLog.log("share: [start capture engine] installing tap, nil format (park-capable)")
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [mixBus] buffer, _ in
+        FileLog.log("share: [start capture engine] connecting input to mixer (park-capable)")
+        engine.connect(inputNode, to: engine.mainMixerNode, format: fmt)
+        FileLog.log("share: [start capture engine] input to mixer connected")
+        FileLog.log("share: [start capture engine] connecting mixer to output (park-capable)")
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: fmt)
+        FileLog.log("share: [start capture engine] mixer to output connected")
+        engine.mainMixerNode.outputVolume = 0
+
+        FileLog.log("share: [start capture engine] installing tap (park-capable)")
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [mixBus] buffer, _ in
             guard let ptrs = buffer.floatChannelData else { return }
             let frames = Int(buffer.frameLength)
             guard frames > 0 else { return }
@@ -413,7 +481,11 @@ final class SystemAudioSharer {
     /// in the safe order.
     @MainActor
     func disable(restartMic: Bool = true) async {
-        guard isSharing, !isTearingDown, !isBusy else { return }
+        guard isSharing else { return }
+        guard !isBusy, !isTearingDown else {
+            FileLog.log("share: disable refused, transition already in progress")
+            return
+        }
 
         // Published FIRST so UI and render path stop consulting the share
         // before anything is torn down.
@@ -446,11 +518,21 @@ final class SystemAudioSharer {
                                 engine: AVAudioEngine?,
                                 multiOutputID: AudioDeviceID?,
                                 memberDeviceID: AudioDeviceID?) {
+        // Stale gate: disable's steps only UNDO, so a returning stale
+        // worker still runs the teardown (restorative), but it must not
+        // race a newer session - restartMic is skipped. While wedged, no
+        // newer session can exist (enable refuses), so there is nothing to
+        // race unless the wedge was already cleared.
+        let stale = isStale(gen)
+        if stale {
+            FileLog.log("share: stale worker returned (gen \(gen)); disable teardown runs restoratively, no mic restart")
+        }
         performTeardown(
             gen: gen, reason: "disable",
-            restartMic: restartMic, cycleMic: true,
+            restartMic: stale ? false : restartMic, cycleMic: true,
             engine: engine, multiOutputID: multiOutputID, memberDeviceID: memberDeviceID
         )
+        if stale { clearWedgeIfStale(gen) }
         finishTransition()
     }
 
@@ -571,6 +653,24 @@ final class SystemAudioSharer {
         DispatchQueue.main.async { [weak self] in
             guard let self, gen == self.transitionGeneration else { return }
             apply()
+        }
+    }
+
+    /// True when the watchdog has already abandoned this transition. Safe
+    /// main.sync: main never dispatches sync onto shareQueue (I5).
+    private func isStale(_ gen: Int) -> Bool {
+        DispatchQueue.main.sync { gen != self.transitionGeneration }
+    }
+
+    /// Clear the wedge latch if this worker is stale (the watchdog fired on
+    /// it) and it managed to return and roll back: the queue demonstrably
+    /// still runs, so sharing can be retried without an app restart. Safe
+    /// main.sync (I5).
+    private func clearWedgeIfStale(_ gen: Int) {
+        DispatchQueue.main.sync {
+            guard gen != self.transitionGeneration, self.shareQueueWedged else { return }
+            self.shareQueueWedged = false
+            FileLog.log("share: parked worker returned and rolled back; wedge cleared")
         }
     }
 

@@ -197,15 +197,12 @@ final class MicProcessor {
         // LATENT HANG PATTERN (same family as share hang #2): this read
         // dispatch_syncs onto the IO unit's queue, so it parks if a device
         // reconfiguration triggered by an earlier pin in the same call is
-        // still in flight. It is currently unreachable-with-race because:
-        // (1) the input device is never rate-mutated in this call (only
-        // pinned via setDevice), so the pin manufactures no
-        // reconfiguration; (2) rate changes arrive via the rebuild path,
-        // whose debounce is >= 1s; (3) alignDeviceSampleRate targets the
-        // OUTPUT device, after the engine already started. Follow-up
-        // trigger: if BlackHole is ever selectable as the mic INPUT and
-        // users report start hangs, apply the share fix here too (nil-format
-        // wiring + a rate-settle wait, or the worker-queue treatment).
+        // still in flight. Census (round 3): this read and the :150 engine
+        // release are the LAST main-thread park-capable sites in the app
+        // (both on the post-teardown mic restart path). Justified because
+        // the mic input is never rate-mutated within the same call and
+        // rebuilds are debounce-settled >= 1s. Revisit if a BlackHole
+        // becomes pinnable as mic input or a retest ever parks here.
         guard inputFormat.sampleRate > 0 else {
             FileLog.log("start: invalid input format")
             destroyAggregateIfNeeded()

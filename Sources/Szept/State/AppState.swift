@@ -58,6 +58,7 @@ final class AppState {
                     try await self.systemSharer.enable(micProcessor: self.micProcessor)
                     await MainActor.run { self.lastError = nil }
                 } catch {
+                    FileLog.log("share: enable error surfaced: \(error.localizedDescription)")
                     await MainActor.run { self.lastError = error.localizedDescription }
                 }
             }
@@ -202,6 +203,7 @@ final class AppState {
                     try await self.systemSharer.enable(micProcessor: self.micProcessor)
                     await MainActor.run { self.lastError = nil }
                 } catch {
+                    FileLog.log("share: enable error surfaced: \(error.localizedDescription)")
                     await MainActor.run { self.lastError = error.localizedDescription }
                 }
             }
