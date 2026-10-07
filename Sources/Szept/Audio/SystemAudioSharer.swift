@@ -50,6 +50,14 @@ import CoreAudio
 /// post-teardown cooldown -> rate-settle wait -> pin -> input-ASBD
 /// stability probe -> explicit client formats. Containment is unchanged:
 /// worker queue + 8s watchdog + stale gates + wedge hygiene.
+///
+/// Round 5: the park class is confirmed as TIMING - client-format
+/// application during unstack; the wired value is irrelevant. The probe
+/// therefore requires >= 2ch for acceptance, and a persistent sub-healthy
+/// read terminates in a RETRYABLE REFUSAL (code 38, one in-band 2s
+/// auto-retry), never in a connect. The watchdog is epoch-guarded so each
+/// re-arm (including the code-38 retry's) gets a fresh budget instead of a
+/// pending stale timer false-wedging the longer legitimate path.
 @Observable
 final class SystemAudioSharer {
 
@@ -94,6 +102,18 @@ final class SystemAudioSharer {
     /// touch 2-5s after teardown unstack churn. Queue-confined.
     private var lastTeardownCompletedAt: Date?
     private static let postTeardownCooldown: TimeInterval = 3.0
+
+    /// Probe cap for the input-ASBD stability wait (round-5 evidence: the
+    /// unstack outlasted the 3s cooldown's ~2s effective remainder plus the
+    /// old 1.5s cap, so the cap now terminates in REFUSAL - code 38, one
+    /// in-band auto-retry - which makes a longer cap safe). Cadence is
+    /// unchanged at 100ms.
+    private static let formatProbeCap: TimeInterval = 4.0
+
+    /// Bumped on every armWatchdog call, main-confined alongside
+    /// transitionGeneration: a newer arm supersedes (invalidates) every
+    /// earlier pending watchdog timer.
+    private var watchdogEpoch = 0
 
     /// The live capture engine, recreated FRESH per enable (AVAudioEngine
     /// restart-after-stop is flaky). Exposed so the lifecycle observer can
@@ -300,9 +320,23 @@ final class SystemAudioSharer {
             do {
                 engine = try startCaptureEngine(blackHoleID: blackHole.id)
             } catch {
-                FileLog.log("share: [\(step)] capture engine start failed (\(error.localizedDescription)), retrying once after 250ms")
-                discardPartialEngine(label: step)
-                usleep(250_000)
+                if (error as NSError).code == 38 {
+                    // Probe refusal: the device is still settling. Give it
+                    // one in-band 2s auto-retry; the re-arm supersedes the
+                    // first watchdog (epoch bump), since this legitimate
+                    // path now runs ~10s total and would false-wedge at the
+                    // first timer's +8s.
+                    FileLog.log("share: device still settling, retrying once in 2s")
+                    armWatchdog(gen)
+                    usleep(2_000_000)
+                } else {
+                    FileLog.log("share: [\(step)] capture engine start failed (\(error.localizedDescription)), retrying once after 250ms")
+                    // Re-arm for uniformity: the first attempt consumed
+                    // part of the budget; the retry deserves a fresh 8s.
+                    armWatchdog(gen)
+                    discardPartialEngine(label: step)
+                    usleep(250_000)
+                }
                 engine = try startCaptureEngine(blackHoleID: blackHole.id)
             }
             // The grace clock starts at engine start, so it also covers the
@@ -398,20 +432,23 @@ final class SystemAudioSharer {
     }
 
     /// Park-safety gate for the connect: wait until the device's input ASBD
-    /// is sane AND stable before a client format is applied onto it (hang
-    /// #4 was an apply-class park onto mid-unstack state; the phantom 1ch
-    /// read is the observable symptom). Primary reads go through
-    /// AudioDeviceManager.inputStreamFormat (device-object, park-safe).
-    /// The first sane >=2ch read is trusted outright (three rounds of
-    /// telemetry showed healthy devices answering 2ch on the first try);
-    /// otherwise re-read every 100ms up to 1.5s, accepting two consecutive
-    /// identical sane reads (preferring a >=2ch stable read over an earlier
-    /// 1ch-stable one if it arrives within the cap). At cap expiry the last
-    /// stable sane read is accepted even if 1ch (custom BlackHole builds
-    /// exist; the tap's mono branch handles it) - probe-on-suspicion, never
-    /// block forever waiting for 2ch. Returns nil only if nothing sane was
-    /// ever read (the caller falls to the helpers/hardcode ladder).
-    private func probeStableInputFormat(deviceID: AudioDeviceID) -> (asbd: AudioStreamBasicDescription, source: String)? {
+    /// is sane, stable, AND >= 2ch before a client format is applied onto
+    /// it. Round-5 reframe: the park is caused by WHEN the unit is touched
+    /// (mid-unstack), not WHAT is wired - so a persistent sub-healthy read
+    /// is a non-quiescence signal that must terminate in refusal, never in
+    /// a connect. Reads go through AudioDeviceManager.inputStreamFormat
+    /// (device-object, park-safe). The first sane >=2ch read is trusted
+    /// outright (probe-on-suspicion); otherwise re-read every 100ms up to
+    /// formatProbeCap (4.0s), accepting two consecutive identical sane
+    /// reads with the accepted read >= 2ch. At cap expiry: log and THROW
+    /// code 38 (the caller performs one in-band 2s auto-retry). Returns nil
+    /// only for read-FAILURES (nil/insane reads) - those fall to the
+    /// round-3 ladder (helpers -> hardcode 48k/2). The distinction: a
+    /// hardwired format is a format GUESS for a device we could not read at
+    /// all; a persistent sub-healthy read is a device answering with
+    /// non-quiescent state, which must never be connected onto. The tap's
+    /// runtime mono branch stays (harmless); nothing wires mono here.
+    private func probeStableInputFormat(deviceID: AudioDeviceID) throws -> (asbd: AudioStreamBasicDescription, source: String)? {
         func read() -> AudioStreamBasicDescription? {
             AudioDeviceManager.inputStreamFormat(deviceID: deviceID)
         }
@@ -421,31 +458,25 @@ final class SystemAudioSharer {
         }
 
         var previous: AudioStreamBasicDescription?
-        var bestStable: AudioStreamBasicDescription?
         var waitedMs = 0
-        while waitedMs < 1500 {
+        let cap = Int(Self.formatProbeCap * 1000)
+        while waitedMs < cap {
             usleep(100_000)
             waitedMs += 100
             guard let current = read() else { previous = nil; continue }
             if let prev = previous, prev.mSampleRate == current.mSampleRate,
-               prev.mChannelsPerFrame == current.mChannelsPerFrame {
-                // Two consecutive identical sane reads: stable.
-                if current.mChannelsPerFrame >= 2 {
-                    FileLog.log("share: [fmt] probe waited \(waitedMs)ms, stabilized \(Int(current.mSampleRate)) Hz \(current.mChannelsPerFrame) ch")
-                    return (current, "device ASBD (stabilized)")
-                }
-                // 1ch-stable: remember it, keep probing for 2ch until the cap.
-                if bestStable == nil {
-                    bestStable = current
-                }
+               prev.mChannelsPerFrame == current.mChannelsPerFrame,
+               current.mChannelsPerFrame >= 2 {
+                // Two consecutive identical sane >=2ch reads: stable.
+                FileLog.log("share: [fmt] probe waited \(waitedMs)ms, stabilized \(Int(current.mSampleRate)) Hz \(current.mChannelsPerFrame) ch")
+                return (current, "device ASBD (stabilized)")
             }
             previous = current
         }
-        if let stable = bestStable {
-            FileLog.log("share: [fmt] probe cap reached, using last stable \(Int(stable.mSampleRate)) Hz \(stable.mChannelsPerFrame) ch")
-            return (stable, "device ASBD (cap, mono)")
-        }
-        return nil
+        let last = previous
+        FileLog.log("share: [fmt] probe cap reached (last \(last.map { "\(Int($0.mSampleRate)) Hz \($0.mChannelsPerFrame) ch" } ?? "no sane read")) - refusing")
+        throw NSError(domain: "Szept", code: 38,
+                      userInfo: [NSLocalizedDescriptionKey: "BlackHole is still settling after share teardown. Try again in a few seconds."])
     }
 
     /// Build, pin, wire, and start the share capture engine. Runs on
@@ -519,7 +550,7 @@ final class SystemAudioSharer {
         var rate: Double
         var channels: Int
         var source: String
-        if let probed = probeStableInputFormat(deviceID: blackHoleID) {
+        if let probed = try probeStableInputFormat(deviceID: blackHoleID) {
             rate = probed.asbd.mSampleRate
             channels = Int(probed.asbd.mChannelsPerFrame)
             source = probed.source
@@ -791,16 +822,25 @@ final class SystemAudioSharer {
     /// no new transition starts, and bump the generation so the (possibly
     /// eventually-returning) worker's flips are all treated as stale.
     private func armWatchdog(_ gen: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
-            guard let self else { return }
-            guard self.isBusy, gen == self.transitionGeneration else { return }
-            FileLog.log("share: transition timed out; worker parked - sharing marked stuck")
-            self.isSharing = false
-            self.isBusy = false
-            self.isTearingDown = false
-            self.shareQueueWedged = true
-            self.transitionGeneration &+= 1
-            self.userNotice = "System audio sharing got stuck. Toggle again or restart the app."
+        // Re-arming supersedes prior pending watchdogs: without the epoch
+        // guard, the code-38 retry's legitimate ~10s path (4s probe cap +
+        // 2s settle + second attempt) would false-wedge when the FIRST
+        // arm's +8s timer fired mid-retry.
+        DispatchQueue.main.sync {
+            self.watchdogEpoch += 1
+            let epoch = self.watchdogEpoch
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+                guard let self else { return }
+                guard epoch == self.watchdogEpoch, self.isBusy,
+                      gen == self.transitionGeneration else { return }
+                FileLog.log("share: transition timed out; worker parked - sharing marked stuck")
+                self.isSharing = false
+                self.isBusy = false
+                self.isTearingDown = false
+                self.shareQueueWedged = true
+                self.transitionGeneration &+= 1
+                self.userNotice = "System audio sharing got stuck. Toggle again or restart the app."
+            }
         }
     }
 
