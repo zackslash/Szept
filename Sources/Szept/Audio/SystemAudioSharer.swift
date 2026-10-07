@@ -492,7 +492,19 @@ final class SystemAudioSharer {
         // matched notifications are dropped for now, and the catch's
         // teardown branch is correct from this point on. main.sync from the
         // queue is deadlock-free: main never syncs onto shareQueue.
-        DispatchQueue.main.sync { self.currentEngine = engine }
+        // The assignment only TRANSFERS the old engine out: releasing it
+        // on main would run its AVAudioEngine dealloc inside this very
+        // sync block - the round-6 deadlock (main parked in dealloc against
+        // a wedged plugin while the worker waits on the block). The old
+        // engine is dropped on the share queue, inside the bracket below.
+        var retiredEngine: AVAudioEngine? = DispatchQueue.main.sync {
+            let old = self.currentEngine
+            self.currentEngine = engine
+            return old
+        }
+        FileLog.log("share: [start capture engine] retiring prior engine (park-capable)")
+        retiredEngine = nil
+        FileLog.log("share: [start capture engine] prior engine retired")
 
         FileLog.log("share: [start capture engine] accessing input node (park-capable)")
         let inputNode = engine.inputNode
@@ -691,10 +703,18 @@ final class SystemAudioSharer {
         // 1. Stop the share capture engine.
         stopShareEngine(engine, label: reason)
 
-        // Release the engine reference on main, bracketed: the AVAudioEngine
-        // dealloc itself is park-capable (it tears down its IO units).
+        // Release the engine reference by TRANSFER: the nil-assignment on
+        // main would drop the last reference there and run the AVAudioEngine
+        // dealloc inside the sync block (round-6 deadlock). Drop it here on
+        // the share queue, bracketed - the dealloc is park-capable (it
+        // tears down its IO units against a possibly-wedged plugin).
         FileLog.log("share: [\(reason)] releasing capture engine (park-capable)")
-        DispatchQueue.main.sync { self.currentEngine = nil }
+        var retiredEngine: AVAudioEngine? = DispatchQueue.main.sync {
+            let old = self.currentEngine
+            self.currentEngine = nil
+            return old
+        }
+        retiredEngine = nil
         FileLog.log("share: [\(reason)] capture engine released")
 
         // 2. Stop the mic engine: it is unpinned, so its muted output unit
@@ -757,7 +777,12 @@ final class SystemAudioSharer {
         guard let engine = currentEngineSnapshot() else { return }
         stopShareEngine(engine, label: label)
         FileLog.log("share: [\(label)] releasing partial capture engine (park-capable)")
-        DispatchQueue.main.sync { self.currentEngine = nil }
+        var retiredEngine: AVAudioEngine? = DispatchQueue.main.sync {
+            let old = self.currentEngine
+            self.currentEngine = nil
+            return old
+        }
+        retiredEngine = nil
         FileLog.log("share: [\(label)] partial capture engine released")
     }
 
