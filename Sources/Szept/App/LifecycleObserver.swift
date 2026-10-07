@@ -115,8 +115,12 @@ final class LifecycleObserver {
             // Never sleep with the share multi-output as the default
             // output: the wake path would leave the meeting device wrong.
             // restartMic=false: the engine goes down for sleep anyway.
+            // Accepted risk: the disable is async now (invariant I5), so
+            // the teardown may straddle the actual sleep; a multi-output
+            // leftover across sleep is owned by launch-time
+            // cleanupStaleDevices and the next enable's stale cleanup.
             if appState.systemSharer.isSharing {
-                appState.systemSharer.disable(restartMic: false)
+                Task { await appState.systemSharer.disable(restartMic: false) }
                 FileLog.log("sleep: system audio sharing disabled")
             }
             if appState.micProcessor.isRunning {

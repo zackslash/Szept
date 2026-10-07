@@ -55,8 +55,12 @@ struct ControlsSection: View {
                 get: { appState.systemSharer.isSharing },
                 set: { _ in AppAction.shareToggle.perform(on: appState) }
             ))
-            .disabled(!appState.micProcessor.isRunning)
-            if appState.systemSharer.isSharing {
+            .disabled(!appState.micProcessor.isRunning || appState.systemSharer.isBusy)
+            if appState.systemSharer.isBusy {
+                Text("Working...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if appState.systemSharer.isSharing {
                 Text("System audio is mixed into the call. Point your call app's speakers at your real output to avoid echo.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

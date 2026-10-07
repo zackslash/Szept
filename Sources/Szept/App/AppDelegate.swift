@@ -94,12 +94,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Quit path: the sharer teardown must run before the process dies, but
+    /// it is async (invariant I5: engine/HAL work never on main), so
+    /// applicationShouldTerminate dispatches it and waits, pumping the main
+    /// run loop (a bare semaphore wait on main would block the Task's
+    /// main-actor entry). Bounded at 2s: a parked worker means the reply
+    /// fires anyway and the leftover multi-output is owned by
+    /// cleanupStaleDevices next launch.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        FileLog.log("quit: applicationShouldTerminate, dispatching share teardown")
+        let done = DispatchSemaphore(value: 0)
+        Task { [appState] in
+            await appState.systemSharer.disable(restartMic: false)
+            done.signal()
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while done.wait(timeout: .now() + 0.05) == .timedOut, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        FileLog.log("quit: share teardown wait done, replying terminate")
+        DispatchQueue.main.async {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        // Sharer teardown FIRST: it restores the default output and stops
-        // the mic engine itself (invariant I1: mic engine stops before the
-        // multi-output is destroyed), in the safe order. The second stop is
-        // idempotent.
-        appState.systemSharer.disable(restartMic: false)
+        // The sharer teardown already ran (or was abandoned, bounded) in
+        // applicationShouldTerminate; it stops the mic engine itself
+        // (invariant I1) in the safe order. This second stop is idempotent
+        // and only covers the case where the sharer had nothing to do.
         appState.micProcessor.stop()
     }
 

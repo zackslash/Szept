@@ -14,29 +14,63 @@ import CoreAudio
 /// Deadlock invariant (I1): the mic engine is UNPINNED, so its muted output
 /// unit is an implicit HAL client of whatever the default output is. The
 /// share teardown therefore stops the mic engine BEFORE destroying the
-/// multi-output (see teardownCapturedDevices): destroying a device an audio
-/// unit still references can deadlock main in AVAudioEngine dealloc against
-/// a wedged HAL plugin. The same invariant forbids stopping the mic engine
+/// multi-output (see performTeardown): destroying a device an audio unit
+/// still references can deadlock main in AVAudioEngine dealloc against a
+/// wedged HAL plugin. The same invariant forbids stopping the mic engine
 /// first when the share is on, while the multi-output is the default: the
 /// sharer teardown (which flips the default back) must run BEFORE the mic
 /// engine stops, which is why callers that stop the mic call
 /// disable(restartMic: false) first.
+///
+/// Hang invariant (I5): no engine/HAL mutation API is ever called on main.
+/// Every one of them can park indefinitely (dispatch_sync onto an IO unit
+/// queue that a device reconfiguration holds): hang #2 was
+/// inputNode.outputFormat(forBus: 0) parking main after our own pin.
+/// Therefore both enable and disable do their engine/HAL work on a
+/// dedicated worker queue (shareQueue), main only publishes state, and an
+/// 8s watchdog converts a parked worker into a "stuck" state (code 37) the
+/// user can recover from by restarting, instead of a hung app. Prevention
+/// (nil formats, rate-settle waits) shrinks the park window; the watchdog
+/// contains the rest.
 @Observable
 final class SystemAudioSharer {
 
     static let multiOutputUID = AudioDeviceManager.shareMultiOutputUID
     private static let previousOutputKey = "systemAudioPreviousOutputUID"
 
+    /// Worker queue for every engine/HAL mutation (invariant I5). Main
+    /// never dispatches sync onto this queue, so main.sync hops from the
+    /// queue back to main are deadlock-free.
+    private let shareQueue = DispatchQueue(label: "dev.zackslash.Szept.share",
+                                           qos: .userInitiated)
+
     private(set) var isSharing = false
+    /// True while an enable/disable transition is queued or running (and
+    /// while a parked worker is wedged). UI double-dispatch guard.
+    private(set) var isBusy = false
     var mixBus = SystemMixBus()
+
+    /// Set by the watchdog when a transition worker parks past the 8s
+    /// deadline. All transitions refuse to start while set; only an app
+    /// restart clears it (the wedged worker cannot be unwound safely).
+    private(set) var shareQueueWedged = false
+    /// Last-recovery message for the user (watchdog parking, etc.). The
+    /// next UI toggle surfaces it via lastError.
+    private(set) var userNotice: String?
 
     /// True between the start and end of a teardown, so a re-entrant
     /// enable() or disable() cannot interleave with one in progress.
     private var isTearingDown = false
 
+    /// Bumped at every transition start (and by the watchdog), so a stale
+    /// worker that eventually unparks cannot publish anything: every
+    /// published flip from the queue is guarded by generation equality.
+    private var transitionGeneration = 0
+
     /// The live capture engine, recreated FRESH per enable (AVAudioEngine
     /// restart-after-stop is flaky). Exposed so the lifecycle observer can
     /// match a configuration-change notification by object identity.
+    /// Main-confined: the worker assigns it via main hops only.
     private(set) var currentEngine: AVAudioEngine?
     private(set) var multiOutputID: AudioDeviceID?
     /// The multi-output's BlackHole member, exposed so a mic rebuild can
@@ -59,13 +93,15 @@ final class SystemAudioSharer {
     private weak var micProcessor: MicProcessor?
 
     /// Injected by AppState: restarts the mic engine after a teardown that
-    /// stopped it (cycleMic). Called only on the main thread.
+    /// stopped it (cycleMic). Invoked on the main thread.
     var restartMicAfterShareTeardown: (() -> Void)?
 
     // MARK: - Enable
 
-    /// Ordered enable with full rollback on any failure. The capture engine
-    /// is built and started BEFORE the multi-output exists, pinned to the
+    /// Ordered enable with full rollback on any failure. Main-thread entry:
+    /// validates state, publishes isBusy, arms the watchdog, and dispatches
+    /// the real work to shareQueue (invariant I5). The capture engine is
+    /// built and started BEFORE the multi-output exists, pinned to the
     /// STANDALONE BlackHole device, so the engine never has a reference to
     /// a device being created/destroyed under it:
     /// 1. resolve BlackHole 16ch (required) and pin it to 48 kHz
@@ -75,20 +111,47 @@ final class SystemAudioSharer {
     /// 5. create the multi-output (speakers main, BlackHole member)
     /// 6. suppression window, flip the default output to the multi-output
     /// 7. isSharing = true (last)
-    func enable(micProcessor: MicProcessor) throws {
+    @MainActor
+    func enable(micProcessor: MicProcessor) async throws {
         guard !isSharing else { return }
+        if shareQueueWedged {
+            throw NSError(domain: "Szept", code: 37,
+                          userInfo: [NSLocalizedDescriptionKey: "Sharing is stuck. Restart the app."])
+        }
         if isTearingDown {
             throw NSError(domain: "Szept", code: 35,
                           userInfo: [NSLocalizedDescriptionKey: "Sharing is shutting down, try again."])
         }
+        guard !isBusy else {
+            FileLog.log("share: enable ignored, transition already in progress")
+            return
+        }
 
+        isBusy = true
+        transitionGeneration &+= 1
+        let gen = transitionGeneration
+        armWatchdog(gen)
+        shareQueue.async { self.performEnable(gen, micProcessor) }
+    }
+
+    /// The enable body. Runs on shareQueue (invariant I5): every engine or
+    /// HAL mutation happens here, never on main. All published state flips
+    /// hop to main, guarded by the transition generation; a stale
+    /// generation means the watchdog already gave up on us, so we roll
+    /// back quietly and flip nothing.
+    private func performEnable(_ gen: Int, _ micProcessor: MicProcessor) {
         var step = "suppression"
+        var multiOutputID: AudioDeviceID?
+        var memberDeviceID: AudioDeviceID?
+        var defaultFlipped = false
         do {
             // Suppression FIRST, before any default-output flip this call
             // may trigger (including the stale-cleanup restore in step 3):
             // the window is time-based, so opening it early is harmless and
-            // closing it late is impossible to get wrong.
-            beginSuppression()
+            // closing it late is impossible to get wrong. The write is
+            // main-confined; the async hop costs microseconds, well inside
+            // the 1.5s window.
+            DispatchQueue.main.async { self.beginSuppression() }
 
             step = "resolve BlackHole"
             // 1. Prefer BlackHole 16ch by name; fall back to any other
@@ -124,6 +187,19 @@ final class SystemAudioSharer {
             }
             AudioDeviceManager.setNominalSampleRate(deviceID: blackHole.id, to: 48000,
                                                     logPrefix: "share")
+            // Rate settle: our own rate set manufactures a device
+            // reconfiguration; the pin in step 4 triggers it again. Poll
+            // until the device reports 48 kHz (up to 500ms) so the pin does
+            // not race the reconfiguration.
+            var waitedMs = 0
+            while AudioDeviceManager.nominalSampleRate(deviceID: blackHole.id) != 48000,
+                  waitedMs < 500 {
+                usleep(50_000)
+                waitedMs += 50
+            }
+            if waitedMs > 0 {
+                FileLog.log("share: [\(step)] rate settling, waited \(waitedMs)ms")
+            }
 
             step = "arm mix bus"
             // 2. Arm the mix bus: capture at the BH16 rate we actually got
@@ -132,7 +208,8 @@ final class SystemAudioSharer {
             // last (barrier inside).
             let inRate = AudioDeviceManager.nominalSampleRate(deviceID: blackHole.id) ?? 48000
             let renderRate = micProcessor.renderSampleRate ?? 48000
-            armedRenderRate = renderRate
+            let armedRate = renderRate
+            publishIfCurrent(gen) { self.armedRenderRate = armedRate }
             mixBus.arm(inputRate: inRate, outputRate: renderRate)
 
             step = "save previous output"
@@ -159,19 +236,23 @@ final class SystemAudioSharer {
             step = "start capture engine"
             // 4. Build + start the capture engine pinned to the STANDALONE
             // BlackHole, before the multi-output exists. One retry after a
-            // 250 ms settle for residual races (a rate change or device
-            // notification still landing).
+            // 250 ms settle for residual races. The retry catches
+            // HAL-REFUSED THROWS only: a park does not throw, it just never
+            // returns; the watchdog owns those.
             self.micProcessor = micProcessor
+            var engine: AVAudioEngine?
             do {
-                try startCaptureEngine(blackHoleID: blackHole.id)
+                engine = try startCaptureEngine(blackHoleID: blackHole.id)
             } catch {
                 FileLog.log("share: [\(step)] capture engine start failed (\(error.localizedDescription)), retrying once after 250ms")
+                discardPartialEngine(label: step)
                 usleep(250_000)
-                try startCaptureEngine(blackHoleID: blackHole.id)
+                engine = try startCaptureEngine(blackHoleID: blackHole.id)
             }
             // The grace clock starts at engine start, so it also covers the
             // multi-output creation + default flip below.
-            enabledAt = Date()
+            publishIfCurrent(gen) { self.enabledAt = Date() }
+            _ = engine
 
             step = "create multi-output"
             // 5. Multi-output: previous default (the speakers) as clock
@@ -186,8 +267,13 @@ final class SystemAudioSharer {
             multiOutputID = try AudioDeviceManager.createMultiOutputDevice(
                 mainUID: mainUID, memberUID: memberUID
             )
-            guard let multiOutputID else {
+            guard let createdID = multiOutputID else {
                 throw AudioDeviceError.multiOutputCreateFailed
+            }
+            let capturedMember = memberDeviceID
+            publishIfCurrent(gen) {
+                self.multiOutputID = createdID
+                self.memberDeviceID = capturedMember
             }
 
             step = "flip default output"
@@ -196,13 +282,14 @@ final class SystemAudioSharer {
             // that would otherwise trigger a full mic rebuild
             // mid-presentation. The window self-expires (~1.5s); it is never
             // closed early so the async change lands inside it.
-            beginSuppression()
-            try AudioDeviceManager.setDefaultOutputDevice(id: multiOutputID)
+            DispatchQueue.main.async { self.beginSuppression() }
+            try AudioDeviceManager.setDefaultOutputDevice(id: createdID)
+            defaultFlipped = true
             FileLog.log("share: [\(step)] default output flipped to multi-output")
 
             // 7. Published last: the UI and the render path only see the
             // share once engine, device flip, and mix bus are all live.
-            isSharing = true
+            publishIfCurrent(gen) { self.isSharing = true }
             FileLog.log("share: [done] system audio sharing enabled")
         } catch {
             let ns = error as NSError
@@ -211,55 +298,86 @@ final class SystemAudioSharer {
             // cycleMic=false when the default flip never succeeded: the mic
             // engine never referenced the multi-output, so it must NOT be
             // stopped. If the flip happened, stop the mic and restart it.
-            teardownCapturedDevices(restartMic: true, cycleMic: step == "flip default output")
-            throw error
+            performTeardown(
+                gen: gen, reason: "enable rollback",
+                restartMic: true, cycleMic: defaultFlipped,
+                engine: currentEngineSnapshot(),
+                multiOutputID: multiOutputID, memberDeviceID: memberDeviceID
+            )
+            // Surface the failure to the user on main.
+            DispatchQueue.main.async {
+                if gen == self.transitionGeneration {
+                    self.userNotice = ns.localizedDescription
+                }
+            }
         }
+        finishTransition()
     }
 
-    /// Build, pin, wire, and start the share capture engine. Tears down any
-    /// previous attempt first, so it is safe to call for the one retry.
-    private func startCaptureEngine(blackHoleID: AudioDeviceID) throws {
-        if let engine = currentEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-            currentEngine = nil
-        }
-
+    /// Build, pin, wire, and start the share capture engine. Runs on
+    /// shareQueue. Every park-capable call is bracketed with FileLog lines
+    /// so a post-mortem shows exactly which call parked. Returns the
+    /// started engine; the identity is already published on main
+    /// (currentEngine) before prepare/start.
+    private func startCaptureEngine(blackHoleID: AudioDeviceID) throws -> AVAudioEngine {
+        FileLog.log("share: [start capture engine] creating AVAudioEngine (park-capable)")
         let engine = AVAudioEngine()
+        FileLog.log("share: [start capture engine] engine created")
         // Assign BEFORE wiring: isSharing is still false, so identity-
         // matched notifications are dropped for now, and the catch's
-        // teardown branch is correct from this point on.
-        currentEngine = engine
+        // teardown branch is correct from this point on. main.sync from the
+        // queue is deadlock-free: main never syncs onto shareQueue.
+        DispatchQueue.main.sync { self.currentEngine = engine }
+
+        FileLog.log("share: [start capture engine] accessing input node (park-capable)")
         let inputNode = engine.inputNode
         guard let inputAU = inputNode.audioUnit else {
             throw NSError(domain: "Szept", code: 33,
                           userInfo: [NSLocalizedDescriptionKey: "Capture node has no underlying audio unit"])
         }
+        FileLog.log("share: [start capture engine] input node accessed")
         // Direct device open on the quiescent STANDALONE BlackHole: a
         // device nothing references yet is universally supported for a
         // pin+start. The private-mini-aggregate escape hatch (building a
         // tiny throwaway aggregate around the BlackHole to satisfy picky
         // HAL states) is deliberately NOT adopted; use it only if a retest
         // shows pin/start failure on the quiescent device.
+        //
+        // Rate-settle context (hang #2): the setNominalSampleRate in step 1
+        // MANUFACTURES the device reconfiguration that this pin then
+        // triggers; enable #1's no-op rate set won that race, enable #2's
+        // real rate set lost it and the pin's reconfiguration parked the
+        // (now off-main) worker. The settle wait above shrinks the window.
         var bhID = blackHoleID
+        FileLog.log("share: [start capture engine] pinning device (park-capable)")
         let pinStatus = AudioUnitSetProperty(
             inputAU, kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global, 0, &bhID,
             UInt32(MemoryLayout<AudioDeviceID>.size)
         )
+        FileLog.log("share: [start capture engine] pin done")
         guard pinStatus == noErr else {
             throw AudioDeviceError.queryFailed(pinStatus)
         }
 
         // Never an empty graph: input -> muted mixer -> output, so the
         // engine has a complete pull chain and only the tap consumes
-        // the audio.
-        let format = inputNode.outputFormat(forBus: 0)
-        engine.connect(inputNode, to: engine.mainMixerNode, format: format)
+        // the audio. NIL FORMATS everywhere: reading
+        // inputNode.outputFormat(forBus: 0) here was hang #2 (it
+        // dispatch_syncs onto the IO unit's queue, which the pin's
+        // reconfiguration can still hold). Passing nil lets the engine
+        // resolve formats internally. Caveat: the internal resolution of
+        // connect(format: nil)/installTap(format: nil) is undocumented and
+        // not a guarantee; if a future macOS breaks it, the fallback is a
+        // post-start format read on the queue, never a pre-pin read.
+        FileLog.log("share: [start capture engine] connecting graph, nil formats (park-capable)")
+        engine.connect(inputNode, to: engine.mainMixerNode, format: nil)
         engine.connect(engine.mainMixerNode, to: engine.outputNode, format: nil)
         engine.mainMixerNode.outputVolume = 0
+        FileLog.log("share: [start capture engine] graph connected")
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [mixBus] buffer, _ in
+        FileLog.log("share: [start capture engine] installing tap, nil format (park-capable)")
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [mixBus] buffer, _ in
             guard let ptrs = buffer.floatChannelData else { return }
             let frames = Int(buffer.frameLength)
             guard frames > 0 else { return }
@@ -269,10 +387,67 @@ final class SystemAudioSharer {
                 mixBus.push(samples: ptrs[0], count: frames)
             }
         }
+        FileLog.log("share: [start capture engine] tap installed")
 
+        FileLog.log("share: [start capture engine] preparing (park-capable)")
         engine.prepare()
+        FileLog.log("share: [start capture engine] prepared, starting (park-capable)")
         try engine.start()
         FileLog.log("share: [start capture engine] engine started on BlackHole id \(blackHoleID)")
+        return engine
+    }
+
+    // MARK: - Disable
+
+    /// Idempotent teardown. Main-thread entry: publishes isSharing=false
+    /// SYNCHRONOUSLY (the sleep path and the UI depend on it), then
+    /// dispatches the engine/HAL work to shareQueue (invariant I5).
+    /// RESTORE BEFORE DESTROY: the default output is moved back to the
+    /// saved device while the multi-output still exists, so the restore can
+    /// never dangle on a destroyed device. The mic engine is stopped (and
+    /// optionally restarted via the injected closure) INSIDE the teardown,
+    /// in the safe order.
+    @MainActor
+    func disable(restartMic: Bool = true) async {
+        guard isSharing, !isTearingDown, !isBusy else { return }
+
+        // Published FIRST so UI and render path stop consulting the share
+        // before anything is torn down.
+        isSharing = false
+        isBusy = true
+        isTearingDown = true
+        transitionGeneration &+= 1
+        let gen = transitionGeneration
+        armWatchdog(gen)
+
+        // Snapshot the published state synchronously on main: later worker
+        // hops must not race the teardown's decisions.
+        let engine = currentEngine
+        let multiOutputID = multiOutputID
+        let memberDeviceID = memberDeviceID
+
+        // Barrier first: the render thread stops mixing immediately; the
+        // ring is intentionally never freed.
+        mixBus.disarm()
+        FileLog.log("share: system audio sharing disabled")
+
+        shareQueue.async { self.performDisable(
+            gen: gen, restartMic: restartMic,
+            engine: engine, multiOutputID: multiOutputID, memberDeviceID: memberDeviceID
+        ) }
+    }
+
+    /// The disable body. Runs on shareQueue (invariant I5).
+    private func performDisable(gen: Int, restartMic: Bool,
+                                engine: AVAudioEngine?,
+                                multiOutputID: AudioDeviceID?,
+                                memberDeviceID: AudioDeviceID?) {
+        performTeardown(
+            gen: gen, reason: "disable",
+            restartMic: restartMic, cycleMic: true,
+            engine: engine, multiOutputID: multiOutputID, memberDeviceID: memberDeviceID
+        )
+        finishTransition()
     }
 
     // MARK: - Teardown
@@ -280,27 +455,35 @@ final class SystemAudioSharer {
     /// The capture-side teardown, in the exact order that keeps the
     /// deadlock invariant I1 (see the class comment): every engine that can
     /// reference the multi-output (via the default output) is stopped
-    /// BEFORE the multi-output is destroyed. One FileLog line per step,
-    /// mirroring the enable/disable log names.
+    /// BEFORE the multi-output is destroyed. Runs on shareQueue. One
+    /// FileLog line per step plus park brackets, mirroring the
+    /// enable/disable log names.
     /// - cycleMic=false is for the enable-catch, where the default flip
     ///   never succeeded and the mic engine never referenced the
     ///   multi-output, so it must not be stopped.
-    private func teardownCapturedDevices(restartMic: Bool, cycleMic: Bool) {
+    private func performTeardown(gen: Int, reason: String,
+                                 restartMic: Bool, cycleMic: Bool,
+                                 engine: AVAudioEngine?,
+                                 multiOutputID: AudioDeviceID?,
+                                 memberDeviceID: AudioDeviceID?) {
         // 1. Stop the share capture engine.
-        if let engine = currentEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-        }
-        currentEngine = nil
+        stopShareEngine(engine, label: reason)
+
+        // Release the engine reference on main, bracketed: the AVAudioEngine
+        // dealloc itself is park-capable (it tears down its IO units).
+        FileLog.log("share: [\(reason)] releasing capture engine (park-capable)")
+        DispatchQueue.main.sync { self.currentEngine = nil }
+        FileLog.log("share: [\(reason)] capture engine released")
 
         // 2. Stop the mic engine: it is unpinned, so its muted output unit
         // is an implicit HAL client of the multi-output (the current
         // default). Zero live clients must remain before the destroy.
         var micWasStopped = false
         if cycleMic, micProcessor?.isRunning == true {
+            FileLog.log("share: [\(reason)] stopping mic engine before multi-output destroy (park-capable)")
             micProcessor?.stop()
             micWasStopped = true
-            FileLog.log("share: mic engine stopped before multi-output destroy")
+            FileLog.log("share: [\(reason)] mic engine stopped before multi-output destroy")
         }
 
         // 3. Restore the default only if we still own it: the user may have
@@ -308,52 +491,103 @@ final class SystemAudioSharer {
         // the restore can never dangle on a destroyed device.
         if let id = multiOutputID,
            AudioDeviceManager.defaultOutputDeviceID() == id {
+            FileLog.log("share: [\(reason)] restoring default output (park-capable)")
             Self.restorePreviousOutputFromDefaults()
+            FileLog.log("share: [\(reason)] default output restored")
         }
 
         // 4. Re-arm suppression around the restore flip, mirroring the
         // enable flip: it equally fires the mic engine's configuration
         // change when the mic engine is still running (cycleMic=false).
-        beginSuppression()
+        DispatchQueue.main.async { self.beginSuppression() }
 
         // 5. Destroy the multi-output (now unreferenced).
         if let id = multiOutputID {
+            FileLog.log("share: [\(reason)] destroying multi-output (park-capable)")
             AudioDeviceManager.destroyShareMultiOutput(id: id)
+            FileLog.log("share: [\(reason)] multi-output destroyed")
         }
 
-        // 6. Clear session state.
-        multiOutputID = nil
-        memberDeviceID = nil
-        armedRenderRate = nil
-        enabledAt = nil
+        // 6. Clear session state (main-confined, generation-guarded).
+        publishIfCurrent(gen) {
+            self.multiOutputID = nil
+            self.memberDeviceID = nil
+            self.armedRenderRate = nil
+            self.enabledAt = nil
+        }
 
-        // 7. Restart the mic engine if this teardown stopped it.
+        // 7. Restart the mic engine if this teardown stopped it (on main).
         if restartMic, micWasStopped {
-            restartMicAfterShareTeardown?()
+            DispatchQueue.main.async {
+                self.restartMicAfterShareTeardown?()
+            }
         }
     }
 
-    /// Idempotent teardown. RESTORE BEFORE DESTROY: the default output is
-    /// moved back to the saved device while the multi-output still exists,
-    /// so the restore can never dangle on a destroyed device. The mic
-    /// engine is stopped (and optionally restarted via the injected
-    /// closure) INSIDE the teardown, in the safe order.
-    func disable(restartMic: Bool = true) {
-        guard isSharing, !isTearingDown else { return }
+    /// Stop and discard a half-built engine from a failed start attempt
+    /// (before the retry). Runs on shareQueue.
+    private func discardPartialEngine(label: String) {
+        guard let engine = currentEngineSnapshot() else { return }
+        stopShareEngine(engine, label: label)
+        FileLog.log("share: [\(label)] releasing partial capture engine (park-capable)")
+        DispatchQueue.main.sync { self.currentEngine = nil }
+        FileLog.log("share: [\(label)] partial capture engine released")
+    }
 
-        isTearingDown = true
-        defer { isTearingDown = false }
+    private func currentEngineSnapshot() -> AVAudioEngine? {
+        DispatchQueue.main.sync { self.currentEngine }
+    }
 
-        // Published FIRST so UI and render path stop consulting the share
-        // before anything is torn down.
-        isSharing = false
+    /// Stop a share capture engine, with park brackets around the two
+    /// park-capable calls. Runs on shareQueue.
+    private func stopShareEngine(_ engine: AVAudioEngine?, label: String) {
+        guard let engine else { return }
+        FileLog.log("share: [\(label)] removing tap (park-capable)")
+        engine.inputNode.removeTap(onBus: 0)
+        FileLog.log("share: [\(label)] tap removed")
+        FileLog.log("share: [\(label)] stopping engine (park-capable)")
+        engine.stop()
+        FileLog.log("share: [\(label)] engine stopped")
+    }
 
-        // Barrier first: the render thread stops mixing immediately; the
-        // ring is intentionally never freed.
-        mixBus.disarm()
-        FileLog.log("share: system audio sharing disabled")
+    /// Clear the transition flags on main. Always runs, even for a stale
+    /// generation: a worker that finished must unconditionally release the
+    /// busy flag, or the sharer would lock itself out.
+    private func finishTransition() {
+        DispatchQueue.main.async {
+            self.isBusy = false
+            self.isTearingDown = false
+        }
+    }
 
-        teardownCapturedDevices(restartMic: restartMic, cycleMic: true)
+    /// Publish a state flip on main, only if this transition is still the
+    /// current one. A stale generation means the watchdog already gave up
+    /// on this worker: flip nothing.
+    private func publishIfCurrent(_ gen: Int, _ apply: @escaping () -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, gen == self.transitionGeneration else { return }
+            apply()
+        }
+    }
+
+    /// +8s main-side watchdog for the current transition: if the worker is
+    /// still busy when it fires, the worker is parked in an engine/HAL call
+    /// and may NEVER return. Declare sharing stuck instead of hanging the
+    /// app: clear the busy flags so the UI unlocks, set the wedged flag so
+    /// no new transition starts, and bump the generation so the (possibly
+    /// eventually-returning) worker's flips are all treated as stale.
+    private func armWatchdog(_ gen: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+            guard let self else { return }
+            guard self.isBusy, gen == self.transitionGeneration else { return }
+            FileLog.log("share: transition timed out; worker parked - sharing marked stuck")
+            self.isSharing = false
+            self.isBusy = false
+            self.isTearingDown = false
+            self.shareQueueWedged = true
+            self.transitionGeneration &+= 1
+            self.userNotice = "System audio sharing got stuck. Toggle again or restart the app."
+        }
     }
 
     // MARK: - External change handling
@@ -369,7 +603,7 @@ final class SystemAudioSharer {
         // covers real loss).
         if let enabledAt, Date().timeIntervalSince(enabledAt) > 2.0 {
             FileLog.log("share: capture engine config changed, disabling")
-            disable(restartMic: true)
+            Task { await self.disable(restartMic: true) }
         }
     }
 
@@ -381,7 +615,7 @@ final class SystemAudioSharer {
         let uids = Set(devices.map(\.uid))
         if !uids.contains(Self.multiOutputUID) {
             FileLog.log("share: multi-output device gone, disabling")
-            disable(restartMic: true)
+            Task { await self.disable(restartMic: true) }
             return
         }
         let blackHoleGone = !devices.contains {
@@ -393,7 +627,7 @@ final class SystemAudioSharer {
                 && AudioDeviceManager.inputChannelCount(deviceID: $0.id) >= 2
         }) {
             FileLog.log("share: BlackHole device gone, disabling")
-            disable(restartMic: true)
+            Task { await self.disable(restartMic: true) }
         }
     }
 
@@ -426,7 +660,9 @@ final class SystemAudioSharer {
 
     // MARK: - Suppression window
 
-    /// Owns the timestamp the lifecycle observer checks. Main thread only.
+    /// Owns the timestamp the lifecycle observer checks. Main thread only
+    /// (worker writes hop to main; the hop costs microseconds, well inside
+    /// the window).
     private var suppressionUntil = Date.distantPast
     private static let suppressionInterval: TimeInterval = 1.5
 

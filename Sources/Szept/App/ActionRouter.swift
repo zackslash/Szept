@@ -85,8 +85,8 @@ enum AppAction {
         if appState.micProcessor.isRunning {
             // Sharer teardown BEFORE the mic stop: it stops the mic engine
             // itself (idempotent) in the safe order, before the
-            // multi-output is destroyed (invariant I1).
-            appState.systemSharer.disable(restartMic: false)
+            // multi-output is destroyed (invariant I1). Async: invariant I5.
+            Task { await appState.systemSharer.disable(restartMic: false) }
             appState.micProcessor.stop()
             // Szept off = everything off: the share mixes into the mic
             // render path, so it cannot outlive the engine.

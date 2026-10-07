@@ -20,8 +20,12 @@ final class AppState {
         // A share teardown that had to stop the mic engine (invariant I1:
         // stop clients before destroying the multi-output) asks us to bring
         // it back through the same retrying start path as everything else.
+        // The sharer invokes this on main; the dispatch keeps that
+        // guaranteed even if a future call site hops.
         systemSharer.restartMicAfterShareTeardown = { [weak self] in
-            self?.startEngineWithRetry(reason: "share teardown")
+            DispatchQueue.main.async {
+                self?.startEngineWithRetry(reason: "share teardown")
+            }
         }
     }
 
@@ -32,9 +36,15 @@ final class AppState {
     }
 
     /// Enable/disable system-audio sharing, surfacing any failure to the
-    /// error banner. Main thread only. lastError is cleared only when an
-    /// actual transition occurred.
+    /// error banner. Main thread only; the sharer's engine/HAL work runs on
+    /// its worker queue (invariant I5), so this spawns Tasks. lastError is
+    /// cleared only when an actual transition occurred.
     func setSystemAudio(_ on: Bool) {
+        // Surface a watchdog notice from a previous stuck transition.
+        if let notice = systemSharer.userNotice {
+            lastError = notice
+            systemSharer.userNotice = nil
+        }
         if on {
             // Sharing requires the mic pipeline to be up: the mix bus is
             // consumed by its render path.
@@ -42,16 +52,21 @@ final class AppState {
                 lastError = "Start processing before sharing system audio."
                 return
             }
-            do {
-                try systemSharer.enable(micProcessor: micProcessor)
-                lastError = nil
-            } catch {
-                lastError = error.localizedDescription
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.systemSharer.enable(micProcessor: self.micProcessor)
+                    await MainActor.run { self.lastError = nil }
+                } catch {
+                    await MainActor.run { self.lastError = error.localizedDescription }
+                }
             }
         } else {
             guard systemSharer.isSharing else { return }
-            systemSharer.disable(restartMic: true)
-            lastError = nil
+            Task { [weak self] in
+                await self?.systemSharer.disable(restartMic: true)
+                await MainActor.run { self?.lastError = nil }
+            }
         }
     }
 
@@ -148,7 +163,7 @@ final class AppState {
                     // failed for its own reasons; no restart loop. The user
                     // re-toggles share after recovery, same as post-sleep.
                     if self.systemSharer.isSharing {
-                        self.systemSharer.disable(restartMic: false)
+                        Task { await self.systemSharer.disable(restartMic: false) }
                     }
                 }
             }
@@ -174,9 +189,22 @@ final class AppState {
            (micProcessor.renderSampleRate != systemSharer.armedRenderRate
                && micProcessor.renderSampleRate != nil)
                || systemSharer.memberDeviceID == micProcessor.outputDeviceID {
-            systemSharer.disable(restartMic: false)
-            do { try systemSharer.enable(micProcessor: micProcessor) }
-            catch { lastError = error.localizedDescription }
+            // Async re-enable (invariant I5): the sharer's engine/HAL work
+            // runs on its worker queue, so the disable+enable pair is
+            // dispatched as a Task; attempt() no longer blocks on it. The
+            // sharer's own isBusy/transition-generation guard keeps the
+            // pair serialized against user toggles.
+            FileLog.log("share: re-enable dispatched post-restart")
+            Task { [weak self] in
+                guard let self else { return }
+                await self.systemSharer.disable(restartMic: false)
+                do {
+                    try await self.systemSharer.enable(micProcessor: self.micProcessor)
+                    await MainActor.run { self.lastError = nil }
+                } catch {
+                    await MainActor.run { self.lastError = error.localizedDescription }
+                }
+            }
         }
         // Preference is never written false on failure: a transient
         // failure must not disable an enabled auto-start. One attempt
