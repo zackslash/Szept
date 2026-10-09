@@ -817,26 +817,17 @@ final class SystemAudioSharer {
         let rate = probed.asbd.mSampleRate
         let channels = Int(probed.asbd.mChannelsPerFrame)
         let source = probed.source
-        FileLog.log("share: [fmt] wiring \(Int(rate)) Hz, \(channels) ch (\(source))")
+        FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch (\(source)) - device-native, no client format set")
 
-        // (5) Raw canonical client ASBD: Float32, native endian,
-        // NON-INTERLEAVED, probed rate + probed channels. The AVFAudio
-        // >2ch nil wall is AVAudioFormat-CONSTRUCTOR-ONLY; raw ASBDs have
-        // no such limit (this deletes the bd45765 converter edge). For
-        // non-interleaved PCM, mBytesPerFrame/mBytesPerPacket are
-        // bytes-per-sample (4): each buffer holds one channel as
-        // contiguous Float32 samples.
-        let clientASBD = AudioStreamBasicDescription(
-            mSampleRate: rate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved | kAudioFormatFlagsNativeEndian,
-            mBytesPerPacket: 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 4,
-            mChannelsPerFrame: UInt32(channels),
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
+        // (5) No ASBD to build: macOS 26.2's HAL unit rejects client
+        // formats on the input element outright (kAudioUnitErr_PropertyNotWritable,
+        // -10865, verified empirically on-device), and none is needed -
+        // the unit delivers the DEVICE'S OWN stream format by default,
+        // the same one the probe read and the context preallocates for.
+        // No format negotiation: no converter, no validator, nothing for
+        // Apple's render-path validation to trip over. (The engine-era
+        // connect did this negotiation under the hood - that converter
+        // edge was the prod crash site.)
 
         // (6) The input callback, refCon via passUnretained (the sharer
         // owns the context and disposes the unit before dropping it).
@@ -856,21 +847,16 @@ final class SystemAudioSharer {
             throw AudioDeviceError.queryFailed(st)
         }
 
-        // (7) The client-format application the probe gates (rounds 4-5
-        // park class; formerly the engine connect, now ONE direct
-        // property set, still on the queue, still bracketed).
-        var asbd = clientASBD
-        FileLog.log("share: [start capture unit] setting client stream format (park-capable)")
-        st = AudioUnitSetProperty(
-            halUnit, kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input, 1, &asbd,
-            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        )
-        FileLog.log("share: [start capture unit] client stream format set")
-        guard st == noErr else {
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
-        }
+        // (7) NO client-format set: macOS 26.2's HAL unit rejects client
+        // formats on the input element outright (kAudioUnitErr_PropertyNotWritable,
+        // verified empirically; the engine-era connect did this work under
+        // the hood and is where the prod crash lived). The unit delivers
+        // the DEVICE'S OWN stream format by default - the same one the
+        // probe read and the context preallocated for - so there is
+        // nothing to negotiate: no converter, no validator, no mismatch.
+        // If the device's format ever shifts under us mid-flight, the
+        // callback's AudioUnitRender reports it and we degrade to silence
+        // (lastRenderStatus) rather than crash.
 
         // (8) Initialize the unit.
         FileLog.log("share: [start capture unit] initializing unit (park-capable)")
