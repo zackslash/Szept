@@ -758,7 +758,7 @@ final class SystemAudioSharer {
         guard parts.count == 4,
               (8_000...192_000).contains(parts[0]),
               (2...64).contains(parts[1]) else { return nil }
-        return (Double(parts[0]), parts[1], parts[2] == 1, UInt32(bitPattern: parts[3]))
+        return (Double(parts[0]), parts[1], parts[2] == 1, UInt32(bitPattern: Int32(parts[3])))
     }
 
     private func probeStableInputFormat(deviceID: AudioDeviceID) throws -> (asbd: AudioStreamBasicDescription, source: String) {
