@@ -1310,17 +1310,17 @@ final class MicProcessor {
         func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255)] }
         let dataBytes = UInt32(frames * 2)
         var wav = Data()
-        wav.append(Data("RIFF".utf8))
-        wav.append(le32(36 + dataBytes))
-        wav.append(Data("WAVE".utf8))
-        wav.append(Data("fmt ".utf8))
-        wav.append(le32(16)); wav.append(le16(1)); wav.append(le16(1))
-        wav.append(le32(48000)); wav.append(le32(48000 * 2))
-        wav.append(le16(2)); wav.append(le16(16))
-        wav.append(Data("data".utf8)); wav.append(le32(dataBytes))
+        wav.append(contentsOf: Data("RIFF".utf8))
+        wav.append(contentsOf: le32(36 + dataBytes))
+        wav.append(contentsOf: Data("WAVE".utf8))
+        wav.append(contentsOf: Data("fmt ".utf8))
+        wav.append(contentsOf: le32(16)); wav.append(contentsOf: le16(1)); wav.append(contentsOf: le16(1))
+        wav.append(contentsOf: le32(48000)); wav.append(contentsOf: le32(96000))
+        wav.append(contentsOf: le16(2)); wav.append(contentsOf: le16(16))
+        wav.append(contentsOf: Data("data".utf8)); wav.append(contentsOf: le32(dataBytes))
         for i in 0..<frames {
             let v = Int16(max(-32767, min(32767, dumpBuffer[i] * 32767)))
-            wav.append(le16(UInt16(bitPattern: v)))
+            wav.append(contentsOf: le16(UInt16(bitPattern: v)))
         }
         let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop/szept-dump.wav")
         do {
