@@ -13,8 +13,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Import signing identity
+        env:
+          CERT_P12_B64: ${{ secrets.SZP_CERT_P12_B64 }}
+          CERT_PASSWORD: ${{ secrets.SZP_CERT_PASSWORD }}
+        run: |
+          # Stable self-signed "Szept Dev" identity: same designated
+          # requirement across releases, so TCC (mic permission) persists
+          # for users upgrading. Gate on the secret so forks without it
+          # still build (ad-hoc fallback inside package.sh).
+          if [ -z "$CERT_P12_B64" ]; then
+            echo "no signing secret; package.sh falls back to ad hoc"
+            exit 0
+          fi
+          echo "$CERT_P12_B64" | base64 --decode > /tmp/szept-dev.p12
+          KC=~/Library/Keychains/szept-dev.keychain-db
+          security create-keychain -p "$CERT_PASSWORD" "$KC"
+          security set-keychain-settings -lu "$KC"
+          security unlock-keychain -p "$CERT_PASSWORD" "$KC"
+          security import /tmp/szept-dev.p12 -k "$KC" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # Trust the self-signed root (passwordless sudo on runners).
+          openssl pkcs12 -in /tmp/szept-dev.p12 -passin pass:"$CERT_PASSWORD" -nokeys -clcerts -out /tmp/szept-dev.crt 2>/dev/null || \
+            openssl pkcs12 -in /tmp/szept-dev.p12 -passin pass:"$CERT_PASSWORD" -legacy -nokeys -clcerts -out /tmp/szept-dev.crt
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain /tmp/szept-dev.crt
+          # codesign only searches the user keychain list.
+          LIST=$(security list-keychains -d user | sed 's/^[[:space:]]*"//;s/"$//' | grep -v szept-dev)
+          security list-keychains -d user -s $LIST "$KC"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -k "$CERT_PASSWORD" "$KC" >/dev/null 2>&1 || true
+          rm /tmp/szept-dev.p12
+          security find-identity -p codesigning "$KC"
+
       - name: Build Szept.app
         run: bash scripts/package.sh
+
+      - name: Cleanup signing keychain
+        if: always()
+        run: |
+          KC=~/Library/Keychains/szept-dev.keychain-db
+          security delete-keychain "$KC" 2>/dev/null || true
+          sudo security remove-trusted-cert \
+            -k /Library/Keychains/System.keychain /tmp/szept-dev.crt 2>/dev/null || true
+          rm -f /tmp/szept-dev.crt
 
       - name: Zip bundle
         run: |

@@ -21,5 +21,18 @@ fi
 # Privacy panes) render a blank icon even though Finder uses the .icns.
 # With no car present, the .icns via CFBundleIconFile is authoritative.
 
-codesign --force --sign - "$APP"
+# Sign with the stable "Szept Dev" identity when its keychain exists
+# (same identity across rebuilds and releases: TCC permissions persist,
+# no mic re-prompt per build), else fall back to ad-hoc. The keychain
+# lives at ~/Library/Keychains/szept-dev.keychain-db and must be in the
+# user keychain search list (see scripts/setup-signing.md).
+KC="$HOME/Library/Keychains/szept-dev.keychain-db"
+if [ -f "$KC" ] && security find-identity -p codesigning "$KC" 2>/dev/null | grep -q "Szept Dev"; then
+    security unlock-keychain "$KC" 2>/dev/null || true
+    codesign --force --sign "Szept Dev" "$APP"
+    echo "Signed with Szept Dev identity"
+else
+    codesign --force --sign - "$APP"
+    echo "note: Szept Dev identity not found, signed ad hoc (TCC will re-prompt per build)"
+fi
 echo "Built $APP"
