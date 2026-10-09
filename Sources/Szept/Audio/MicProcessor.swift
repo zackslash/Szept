@@ -917,7 +917,7 @@ final class MicProcessor {
             context.framePosition += Double(frames)
             var ts = AudioTimeStamp()
             ts.mSampleTime = context.framePosition
-            ts.mFlags = AudioTimeStampFlags.audioTimeStampSampleTimeValid
+            ts.mFlags = AudioTimeStampFlags(rawValue: kAudioTimeStampSampleTimeValid)
             var renderFlags = AudioUnitRenderActionFlags()
             let outList = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.outListPtr))
             let status = AudioUnitRender(iso, &renderFlags, &ts, 0, UInt32(frames), outList)
