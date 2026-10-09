@@ -204,8 +204,20 @@ fileprivate final class CaptureContext {
 /// Opaque handle for a live share capture: the raw HAL IOProc and its
 /// device.
 fileprivate struct ShareCaptureHandle {
-    let ioProc: AudioDeviceIOProcID
+    /// Identity tag (IOProc IDs are function-pointer typealiases on
+    /// this SDK and not comparable; a monotonically increasing tag
+    /// serves the ownership comparison).
+    private static var nextTag: UInt32 = 0
+    let tag: UInt32
     let device: AudioDeviceID
+    let ioProc: AudioDeviceIOProcID
+
+    init(device: AudioDeviceID, ioProc: AudioDeviceIOProcID) {
+        ShareCaptureHandle.nextTag += 1
+        self.tag = ShareCaptureHandle.nextTag
+        self.device = device
+        self.ioProc = ioProc
+    }
 }
 
 /// The share capture IOProc: a STORED C function pointer, NOT a
@@ -874,7 +886,7 @@ final class SystemAudioSharer {
 
         // (3)
         FileLog.log("share: [start capture] live, \(Int(rate)) Hz \(channels) ch")
-        return (ShareCaptureHandle(ioProc: ioProc, device: blackHoleID), context, rate)
+        return (ShareCaptureHandle(device: blackHoleID, ioProc: ioProc), context, rate)
     }
 
     // MARK: - Disable
@@ -973,7 +985,7 @@ final class SystemAudioSharer {
         // a capture handle is a value type - no dealloc
         // transfer story exists).
         stopCaptureUnit(unit: unit, context: context, label: reason)
-        if activeUnit?.ioProc == unit?.ioProc { activeUnit = nil }
+        if activeUnit?.tag == unit?.tag { activeUnit = nil }
         if activeContext === context { activeContext = nil }
 
         // 2. Stop the mic engine: it is unpinned, so its muted output unit
