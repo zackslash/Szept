@@ -132,6 +132,11 @@ fileprivate final class CaptureContext {
     /// write/read ordering is the unit lifetime itself.
     nonisolated(unsafe) var lastRenderStatus: OSStatus = 0
     nonisolated(unsafe) var overflowCount: Int = 0
+    /// Per-render error COUNT (lastRenderStatus only keeps the last
+    /// code). A start transient errors once; a real shape mismatch
+    /// (cached format stale) errors on EVERY render and hits 100 within
+    /// ~2s of audio - that is the signal that clears the format cache.
+    nonisolated(unsafe) var renderErrorCount: Int = 0
 
     init(channels: Int, interleaved: Bool, mixBus: SystemMixBus) {
         self.channels = channels
@@ -212,6 +217,7 @@ fileprivate let captureInputCallback: AURenderCallback = { refCon, _, inTimeStam
     )
     if status != noErr {
         context.lastRenderStatus = status
+        context.renderErrorCount += 1
         return noErr
     }
     if clipped {
@@ -1175,14 +1181,17 @@ final class SystemAudioSharer {
         }
         if let context {
             if context.lastRenderStatus != 0 {
-                FileLog.log("share: [\(label)] capture renders errored \(context.lastRenderStatus) during session")
-                if context.lastRenderStatus == -50 {
-                    // paramErr = the delivered stream shape mismatched the
-                    // allocated context: the cached format is stale (e.g.
-                    // the device was reconfigured in Audio MIDI Setup).
-                    // Clear it so the next enable probes fresh.
+                FileLog.log("share: [\(label)] capture renders errored \(context.lastRenderStatus) during session (\(context.renderErrorCount) renders)")
+                if context.lastRenderStatus == -50 && context.renderErrorCount > 100 {
+                    // paramErr on MOST renders = the delivered stream shape
+                    // mismatched the allocated context: the cached format
+                    // is stale (e.g. the device was reconfigured in Audio
+                    // MIDI Setup). A single -50 is a known start transient
+                    // (first pull before the device streams) and must NOT
+                    // clear the cache - doing so re-exposes every later
+                    // enable to the poisoned in-process format read.
                     UserDefaults.standard.removeObject(forKey: "shareCaptureFormatCache")
-                    FileLog.log("share: [\(label)] capture format cache cleared (shape mismatch)")
+                    FileLog.log("share: [\(label)] capture format cache cleared (persistent shape mismatch)")
                 }
             }
             if context.overflowCount > 0 {
