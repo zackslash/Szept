@@ -138,7 +138,6 @@ fileprivate let micIOProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, cli
     guard let clientData else { return noErr }
     let processor = Unmanaged<MicProcessor>.fromOpaque(clientData).takeUnretainedValue()
     guard let context = processor.captureContext else { return noErr }
-    guard let inInputData else { return noErr }
     let abl = UnsafeMutableAudioBufferListPointer(
         UnsafeMutablePointer(mutating: inInputData)
     )
