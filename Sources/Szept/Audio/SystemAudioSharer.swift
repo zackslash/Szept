@@ -203,7 +203,7 @@ fileprivate final class CaptureContext {
 
 /// Opaque handle for a live share capture: the raw HAL IOProc and its
 /// device.
-fileprivate struct ShareCaptureHandle {
+fileprivate struct ShareCaptureHandle: Equatable {
     let ioProc: AudioDeviceIOProcID
     let device: AudioDeviceID
 }
