@@ -134,7 +134,7 @@ fileprivate final class MicCaptureContext {
 /// unit, no elements, no client formats. Copies the device bytes into
 /// the context's preallocated data area, then hands off to
 /// processCapture.
-fileprivate let micIOProc: AudioDeviceIOProc = { clientData, _, inInputData, _, _, _ -> OSStatus in
+fileprivate let micIOProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, clientData -> OSStatus in
     let processor = Unmanaged<MicProcessor>.fromOpaque(clientData).takeUnretainedValue()
     guard let context = processor.captureContext else { return noErr }
     guard let inInputData else { return noErr }
