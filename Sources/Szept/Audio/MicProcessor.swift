@@ -135,6 +135,7 @@ fileprivate final class MicCaptureContext {
 /// the context's preallocated data area, then hands off to
 /// processCapture.
 fileprivate let micIOProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, clientData -> OSStatus in
+    guard let clientData else { return noErr }
     let processor = Unmanaged<MicProcessor>.fromOpaque(clientData).takeUnretainedValue()
     guard let context = processor.captureContext else { return noErr }
     guard let inInputData else { return noErr }
@@ -485,7 +486,7 @@ final class MicProcessor {
         let ioprocStatus = AudioDeviceCreateIOProcID(
             inputID, micIOProc,
             Unmanaged.passUnretained(self).toOpaque(),
-            nil, &newIOProc
+            &newIOProc
         )
         FileLog.log("mic: [input ioproc] created: \(ioprocStatus)")
         guard ioprocStatus == noErr, let theProc = newIOProc else {
