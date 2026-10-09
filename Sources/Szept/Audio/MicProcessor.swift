@@ -441,15 +441,35 @@ final class MicProcessor {
         FileLog.log("start: input format \(Int(inputRate)) Hz, \(inputChannels) ch \(inputInterleaved ? "interleaved" : "non-interleaved")")
 
         // 5. RT context for the input callback, shaped to the PROBED
-        // format (no client format is ever set on the unit - macOS 26.2
-        // rejects it, and the device's own format is what arrives).
-        let context = MicCaptureContext(asbd: probed)
+        // format. The context's interleaved flag follows the CLIENT
+        // format below (canonical Float32 non-interleaved) - the buffers
+        // the callback renders arrive in the client format's shape.
+        let clientASBD = AudioStreamBasicDescription(
+            mSampleRate: inputRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: UInt32(inputChannels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        let context = MicCaptureContext(asbd: clientASBD)
         captureContext = context
 
         // 6. Build the input unit (input element enabled, output
-        // disabled, pinned to the mic interface, input callback
-        // registered; NO client-format set).
-        let newInputUnit = try buildInputUnit(deviceID: inputID)
+        // disabled, pinned to the mic interface, CLIENT FORMAT SET,
+        // input callback registered). The client format is
+        // load-bearing: a format-less input unit's IO runs and its
+        // callback fires, but the device's input stream is never
+        // configured and every buffer delivers zeros (verified via the
+        // in-app dump: 5s of exact zeros with audible speech and the
+        // callback sampled live; the AVAudioEngine era worked because
+        // the engine set this format internally). The round-10
+        // "-10865 rejects client formats" finding was BlackHole-16ch
+        // SPECIFIC - the mic accepts the set (verified on-device).
+        let newInputUnit = try buildInputUnit(deviceID: inputID, clientFormat: clientASBD)
         inputUnit = newInputUnit
 
         // 7. Build the isolation AU (mono float32 both scopes, render
@@ -725,7 +745,7 @@ final class MicProcessor {
     /// Apple's render-path validation to trip over. Every mutation is
     /// FileLog-bracketed (park-capable). Failure at any step disposes
     /// what was created before throwing.
-    private func buildInputUnit(deviceID: AudioDeviceID) throws -> AudioComponentInstance {
+    private func buildInputUnit(deviceID: AudioDeviceID, clientFormat: AudioStreamBasicDescription) throws -> AudioComponentInstance {
         FileLog.log("mic: [input unit] finding HALOutput component (park-capable)")
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
@@ -778,6 +798,24 @@ final class MicProcessor {
             UInt32(MemoryLayout<AudioDeviceID>.size)
         )
         FileLog.log("mic: [input unit] pin done")
+        guard st == noErr else {
+            AudioComponentInstanceDispose(unit)
+            throw AudioDeviceError.queryFailed(st)
+        }
+
+        // CLIENT FORMAT (input scope, element 1): configures the device's
+        // input stream for this client. Without it the IO cycle runs and
+        // the callback fires, but the stream is never configured and every
+        // buffer is zeros (see startLocked step 6 note). BlackHole 16ch
+        // rejects this set (-10865, round 10) - mic interfaces accept it.
+        var cfmt = clientFormat
+        FileLog.log("mic: [input unit] setting client format (park-capable)")
+        st = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 1, &cfmt,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        FileLog.log("mic: [input unit] client format set: \(st)")
         guard st == noErr else {
             AudioComponentInstanceDispose(unit)
             throw AudioDeviceError.queryFailed(st)
