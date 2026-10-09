@@ -1,8 +1,179 @@
 import Foundation
-import AVFoundation
 import AudioToolbox
 import Accelerate
 import os.log
+
+/// Real-time state for the mic capture callback. Plain final class,
+/// mirroring the sharer's CaptureContext (see SystemAudioSharer): the
+/// render callback is a bare C function with NO ObjC entry, so the
+/// context must not be touchable as an ObjC object. RT rules: the
+/// callbacks take NO locks, do NO allocation, and touch NO ObjC runtime.
+/// The processor owns the context for the input unit's whole lifetime
+/// and disposes the unit before dropping the context, so the callbacks
+/// can never observe a dead refCon.
+fileprivate final class MicCaptureContext {
+    let channels: Int
+    /// True when the probed ASBD lacks kAudioFormatFlagIsNonInterleaved:
+    /// one buffer, all channels packed (the common interface shape).
+    let interleaved: Bool
+    /// Frames between successive channel-0 samples in the interleaved
+    /// buffer (== channels); 1 in the non-interleaved walk.
+    let stride: Int
+    let capacityFrames: UInt32 = 4096
+
+    /// Preallocated input list, shaped to the PROBED device format:
+    /// interleaved -> a single buffer of `channels` x 4096 frames;
+    /// non-interleaved -> one mono buffer per channel. Built ONCE at
+    /// build time; the callback only fills it.
+    let inListPtr: UnsafeMutableRawPointer
+    /// Preallocated output list for the isolation AU's pull: one mono
+    /// float32 buffer of 4096 frames (the AU is configured mono in both
+    /// scopes, so one buffer is always the right shape).
+    let outListPtr: UnsafeMutableRawPointer
+    /// Mono scratch the callback deinterleaves channel 0 into (RT:
+    /// no allocation), and the meter/chain input.
+    let inMono: UnsafeMutablePointer<Float>
+
+    /// Monotonically advancing sample-time stamp for the isolation AU's
+    /// render pulls. Advanced by the callback; NO clock calls in RT.
+    nonisolated(unsafe) var framePosition: Double = 0
+    /// Last isolation AudioUnitRender status (fail-open diagnostics),
+    /// logged only in stopLocked AFTER the units are stopped.
+    nonisolated(unsafe) var isolationStatus: OSStatus = 0
+    /// Last input AudioUnitRender status (same diagnostics discipline).
+    nonisolated(unsafe) var renderStatus: OSStatus = 0
+    /// Count of input renders clipped to the preallocated capacity.
+    nonisolated(unsafe) var overflowCount: Int = 0
+
+    init(asbd: AudioStreamBasicDescription) {
+        channels = Int(asbd.mChannelsPerFrame)
+        interleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        stride = interleaved ? channels : 1
+        inMono = .allocate(capacity: 4096)
+        let frameBytes = 4096 * MemoryLayout<Float>.size
+        let listSize: Int
+        if interleaved {
+            listSize = MemoryLayout<AudioBufferList>.size
+        } else {
+            listSize = MemoryLayout<AudioBufferList>.size
+                + (channels - 1) * MemoryLayout<AudioBuffer>.stride
+        }
+        let inDataSize = 4096 * channels * MemoryLayout<Float>.size
+        let inTotal = listSize + inDataSize
+        inListPtr = UnsafeMutableRawPointer.allocate(
+            byteCount: inTotal, alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        memset(inListPtr, 0, inTotal)
+        let inBuffers = UnsafeMutableAudioBufferListPointer(
+            inListPtr.assumingMemoryBound(to: AudioBufferList.self)
+        )
+        var dataOffset = listSize
+        if interleaved {
+            // One buffer, all channels interleaved - the device's native
+            // delivery shape (AudioUnitRender validates the list against
+            // the device format; a mismatch is -50 paramErr).
+            inBuffers.count = 1
+            inBuffers[0] = AudioBuffer(
+                mNumberChannels: UInt32(channels),
+                mDataByteSize: UInt32(inDataSize),
+                mData: inListPtr + dataOffset
+            )
+        } else {
+            inBuffers.count = channels
+            for i in 0..<channels {
+                inBuffers[i] = AudioBuffer(
+                    mNumberChannels: 1,
+                    mDataByteSize: UInt32(frameBytes),
+                    mData: inListPtr + dataOffset
+                )
+                dataOffset += frameBytes
+            }
+        }
+        let outTotal = MemoryLayout<AudioBufferList>.size + frameBytes
+        outListPtr = UnsafeMutableRawPointer.allocate(
+            byteCount: outTotal, alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        memset(outListPtr, 0, outTotal)
+        let outBuffers = UnsafeMutableAudioBufferListPointer(
+            outListPtr.assumingMemoryBound(to: AudioBufferList.self)
+        )
+        outBuffers.count = 1
+        outBuffers[0] = AudioBuffer(
+            mNumberChannels: 1,
+            mDataByteSize: UInt32(frameBytes),
+            mData: outListPtr + MemoryLayout<AudioBufferList>.size
+        )
+    }
+
+    deinit {
+        inListPtr.deallocate()
+        outListPtr.deallocate()
+        inMono.deallocate()
+    }
+}
+
+/// The mic input callback: a STORED C function pointer, NOT a closure
+/// over self (no context capture means no ObjC, no allocation, no
+/// locking on the RT thread). refCon is the MicProcessor (same pattern
+/// as drainRing's refCon). Renders bus 1 element 0 into the context's
+/// preallocated input list, then hands off to processCapture. On
+/// AudioUnitRender error: record renderStatus and return noErr - never
+/// fail the unit over one bad render.
+fileprivate let micInputCallback: AURenderCallback = { refCon, _, inTimeStamp, _, inNumberFrames, _ -> OSStatus in
+    let processor = Unmanaged<MicProcessor>.fromOpaque(refCon).takeUnretainedValue()
+    guard let unit = processor.inputUnit, let context = processor.captureContext else { return noErr }
+    // Clamp to the preallocated capacity; count the overflow instead of
+    // growing (RT: no allocation).
+    var frames = Int(inNumberFrames)
+    if frames > Int(context.capacityFrames) {
+        frames = Int(context.capacityFrames)
+        context.overflowCount += 1
+    }
+    var renderFlags = AudioUnitRenderActionFlags()
+    let list = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.inListPtr))
+    let status = AudioUnitRender(
+        unit, &renderFlags, inTimeStamp, 1, UInt32(frames), list
+    )
+    if status != noErr {
+        context.renderStatus = status
+        return noErr
+    }
+    guard frames > 0 else { return noErr }
+    processor.processCapture(frames: frames, timestamp: inTimeStamp)
+    return noErr
+}
+
+/// The isolation AU's input render callback (SetRenderCallback, input
+/// scope, refCon = the processor): copies channel 0 of the capture
+/// context's input list into the AU's input list, layout-aware -
+/// interleaved stride walk or direct mData[0]. The AU is mono in both
+/// scopes, so one destination buffer is always the right shape.
+fileprivate let isolationInputCallback: AURenderCallback = { refCon, _, _, _, inNumberFrames, ioData -> OSStatus in
+    let processor = Unmanaged<MicProcessor>.fromOpaque(refCon).takeUnretainedValue()
+    guard let context = processor.captureContext else { return noErr }
+    guard let ioList = ioData, ioList.pointee.mNumberBuffers > 0,
+          let dst = ioList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+    let inABL = UnsafeMutableAudioBufferListPointer(
+        UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.inListPtr))
+    )
+    guard inABL.count > 0, let src = inABL[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+    let frames = min(Int(inNumberFrames), Int(context.capacityFrames))
+    if context.interleaved, context.channels > 1 {
+        let stride = context.stride
+        var i = 0
+        while i < frames {
+            dst[i] = src[i * stride]
+            i += 1
+        }
+    } else {
+        var i = 0
+        while i < frames {
+            dst[i] = src[i]
+            i += 1
+        }
+    }
+    return noErr
+}
 
 @Observable
 final class MicProcessor {
@@ -19,7 +190,7 @@ final class MicProcessor {
 
     nonisolated(unsafe) private var tapIsolation: Float = 50
     // Voice-only mute. Main-thread writes via setVoiceMuted, render thread
-    // reads in processTap; single word, same pattern as tapIsolation.
+    // reads in processCapture; single word, same pattern as tapIsolation.
     // Session-scoped: never persisted anywhere, so a fresh launch always
     // starts audible.
     nonisolated(unsafe) private(set) var voiceMuted = false
@@ -41,7 +212,7 @@ final class MicProcessor {
         self.systemMixBus = systemMixBus
     }
 
-    /// The engine input/render rate of the current start, read by the
+    /// The capture/render rate of the current start, read by the
     /// system-audio sharer to arm its mix bus servo. Written by start()
     /// only; single-word store, read cross-thread.
     nonisolated(unsafe) var renderSampleRate: Double?
@@ -49,7 +220,7 @@ final class MicProcessor {
     // MARK: - Meter and process-activity state (main thread only)
 
     private var meterTimer: Timer?
-    // Process activity token held while the engine runs (App Nap guard).
+    // Process activity token held while the pipeline runs (App Nap guard).
     private var activity: NSObjectProtocol?
     // Display-side staleness tracking: when the capture stream stalls the
     // render-side value stops changing and the bar would freeze at the
@@ -85,7 +256,7 @@ final class MicProcessor {
     private var aggregateChannelCount: UInt32 = 0
 
     /// Destroy the aggregate we created, if any. Keeps the invariant that
-    /// aggregateDeviceID is non-nil only while the engine is running.
+    /// aggregateDeviceID is non-nil only while the pipeline is running.
     private func destroyAggregateIfNeeded() {
         if let id = aggregateDeviceID {
             aggregateDeviceID = nil
@@ -101,39 +272,52 @@ final class MicProcessor {
         UserDefaults.standard.object(forKey: "useAggregateDevice") as? Bool ?? true
     }
 
-    // MARK: - AVAudioEngine
+    // MARK: - Dedicated HAL units (input capture + isolation effect)
 
-    private var engine = AVAudioEngine()
-    private var isolationUnit: AVAudioUnitEffect?
     private let logger = Logger(subsystem: "dev.zackslash.Szept", category: "MicProcessor")
 
+    // The mic pipeline has NO AVAudioEngine (invariant I6 below): input
+    // capture is a dedicated HALOutput unit pinned to the mic interface,
+    // feeding the ring through micInputCallback, and the AUSoundIsolation
+    // effect is a dedicated AudioComponentInstance pulled manually from
+    // processCapture. The dedicated output unit (below) is unchanged. All
+    // IO is HAL units with explicit lifecycles, so the engine's graph
+    // assembly and its converter stack are gone entirely.
+    //
+    // Invariant I1 (deadlock): the mic path no longer contributes ANY
+    // client on the default output - the input unit is pinned to the mic
+    // interface, and the output unit is pinned to its own target. The
+    // sharer's stop-before-destroy ordering is retained regardless (belt
+    // and braces; see SystemAudioSharer's I1).
+    //
+    // Invariant I6 (structural immunity): the app contains ZERO
+    // AVAudioEngines; all IO is dedicated HAL units with explicit
+    // lifecycles. Default-output changes are therefore structurally
+    // invisible to the pipeline - the prod crash class (the engine's
+    // unpinned muted output unit re-targeting onto a wide-channel share
+    // multi-output and tripping Apple's converter validation) cannot
+    // exist here: there is no engine to re-target.
+
     /// Serializes start()/stop() against each other. The share teardown
-    /// stops this engine from the sharer's worker queue (invariant I1),
+    /// stops these units from the sharer's worker queue (invariant I1),
     /// while stop()/start() also run on main (toggleEngine, wake rebuild,
-    /// terminate); without the lock the engine/outputUnit/isRunning
-    /// mutation sections could interleave across threads. NSLock (not
-    /// recursive): start()'s internal failure path calls the UNLOCKED
-    /// stopLocked(), never stop().
+    /// terminate); without the lock the unit/isRunning mutation sections
+    /// could interleave across threads. NSLock (not recursive):
+    /// start()'s internal failure path calls the UNLOCKED stopLocked(),
+    /// never stop().
     private let lifecycleLock = NSLock()
 
-    // MARK: - Dedicated output unit (owned by us, invisible to the engine)
-    //
-    // AVAudioEngine owns its output unit's device selection and resets it
-    // during graph assembly, so the engine's output can never be trusted to
-    // reach BlackHole. The engine's mixer is muted (it exists only to pull
-    // input through the isolation AU), and this separate HAL output unit
-    // feeds the target device from a ring buffer filled by the tap. The
-    // engine's device pin is deliberately NOT set: if it ever stuck, the
-    // engine would write digital zeros into BlackHole alongside our voice.
-    //
-    // Invariant I1 (deadlock): because the engine is unpinned, its muted
-    // output unit is an implicit HAL client of whatever the CURRENT DEFAULT
-    // output is. While system-audio sharing is on, that default is the share
-    // multi-output; the share teardown therefore stops THIS engine BEFORE
-    // destroying the multi-output (see SystemAudioSharer.performTeardown),
-    // because destroying a device that an audio unit still references can
-    // deadlock main in AVAudioEngine dealloc
-    // against a wedged HAL plugin (reproduced on macOS 26.2).
+    /// The dedicated HAL input unit (HALOutput, input element enabled,
+    /// pinned to the mic interface). Built in startLocked, disposed in
+    /// stopLocked. File-accessible for the C callbacks in this file.
+    nonisolated(unsafe) fileprivate var inputUnit: AudioComponentInstance?
+    /// The dedicated AUSoundIsolation instance, mono float32 in both
+    /// scopes, pulled manually by processCapture. Nil = fail-open (the
+    /// voice chain runs WITHOUT isolation; logged at start).
+    nonisolated(unsafe) fileprivate var isolationAU: AudioComponentInstance?
+    /// RT state for micInputCallback (see the context's doc at the top
+    /// of the file). Non-nil only while inputUnit is live.
+    nonisolated(unsafe) fileprivate var captureContext: MicCaptureContext?
 
     private var outputUnit: AudioComponentInstance?
     private var ring: UnsafeMutablePointer<Float>?
@@ -163,7 +347,7 @@ final class MicProcessor {
 
     /// start() body; caller holds lifecycleLock. The sharer's queue-side
     /// stop (I1 teardown) can no longer interleave with this section's
-    /// engine/outputUnit/isRunning mutations.
+    /// unit/isRunning mutations.
     private func startLocked() throws {
         guard !isRunning else { return }
 
@@ -173,25 +357,7 @@ final class MicProcessor {
         // also restores any pre-bypass isolation/clarity).
         if isBypassed { setBypassed(false) }
 
-        // Always create a fresh engine to avoid state issues. The OLD
-        // engine must never be released on main: its dealloc closes the
-        // output unit's HAL client and can park indefinitely when the
-        // device side is mid-churn (the round-6 deadlock class; the
-        // post-share-teardown deferred restart aims straight at that
-        // churn window). passRetained PINS a reference that the utility
-        // queue releases deterministically - ARC alone cannot guarantee
-        // this: a fast closure run can die before the caller's epilogue,
-        // leaving the epilogue's release as the LAST one, putting the
-        // dealloc right back on main (verified by sample, 2026-10-09).
-        let retiredEngine = Unmanaged.passRetained(engine)
-        engine = AVAudioEngine()
-        DispatchQueue.global(qos: .utility).async {
-            FileLog.log("mic: [retire engine] releasing old engine off-main (park-capable)")
-            retiredEngine.release()
-            FileLog.log("mic: [retire engine] released")
-        }
-        isolationUnit = nil
-
+        // 1. Resolve the output device (unchanged contract).
         if outputDeviceID == nil {
             outputDeviceID = try AudioDeviceManager.firstBlackHole()?.id
             if outputDeviceID == nil {
@@ -202,6 +368,7 @@ final class MicProcessor {
         }
         FileLog.log("start: output device id \(outputDeviceID!)")
 
+        // 2. Private aggregate for the output bridge (unchanged).
         if useAggregateDevice {
             setupAggregateDevice()
         } else {
@@ -209,92 +376,128 @@ final class MicProcessor {
             destroyAggregateIfNeeded()
         }
 
-        do {
-            if let id = inputDeviceID {
-                try setDevice(id, on: engine.inputNode)
-                FileLog.log("start: input device pinned to \(id)")
+        // 3. Resolve the input device: the pinned selection, else the
+        // system default input (same resolution and logs as the
+        // aggregate's input leg).
+        let inputID: AudioDeviceID
+        if let pinned = inputDeviceID {
+            inputID = pinned
+            FileLog.log("start: input device is pinned device id \(pinned)")
+        } else {
+            do {
+                inputID = try AudioDeviceManager.defaultInputDeviceID()
+                FileLog.log("start: input device is system default input id \(inputID)")
+            } catch {
+                FileLog.log("start: no input device: \(error.localizedDescription)")
+                destroyAggregateIfNeeded()
+                throw NSError(domain: "MicProcessor", code: 20,
+                              userInfo: [NSLocalizedDescriptionKey: "No input device found. Connect a microphone or pick another microphone in Settings."])
             }
-        } catch {
-            FileLog.log("start: input device set failed: \(error.localizedDescription)")
-            destroyAggregateIfNeeded()
-            isolationUnit = nil
-            throw error
         }
 
-        let unit = AVAudioUnitEffect(audioComponentDescription: Self.isolationDescription)
-        isolationUnit = unit
-
-        engine.attach(unit)
-
-        let inputFormat = engine.inputNode.outputFormat(forBus: 0)
-        // LATENT HANG PATTERN (same family as share hang #2): this read
-        // dispatch_syncs onto the IO unit's queue, so it parks if a device
-        // reconfiguration triggered by an earlier pin in the same call is
-        // still in flight. Census: main-thread park-capable sites are this
-        // read and stop()'s engine/AU teardown (the engine re-assignment
-        // in start() now releases the old engine OFF-main - see the
-        // retire block above; stop() itself runs on main from
-        // toggleEngine/terminate AND from the sharer's queue, where the
-        // lock serializes it against main). Pre-existing and bounded: the
-        // debounce settles rebuilds >= 1s and the I1 ordering keeps the
-        // multi-output alive until the mic is stopped. Revisit if a
-        // BlackHole becomes pinnable as mic input or a retest ever parks
-        // here.
-        guard inputFormat.sampleRate > 0 else {
-            FileLog.log("start: invalid input format")
-            destroyAggregateIfNeeded()
-            engine.detach(unit)
-            isolationUnit = nil
-            throw NSError(domain: "MicProcessor", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "Invalid audio input format"])
+        // 4. LIGHT settle-check, deliberately NOT the share path's probe:
+        // the mic interface is not a device we churn clients on (no pin
+        // against post-teardown unstack churn, no shared-member
+        // multi-output history), so the poison class behind the share
+        // probe's strictness does not apply. Two inputStreamFormat reads
+        // 50ms apart, identical and sane, within 500ms, is enough.
+        var asbd: AudioStreamBasicDescription?
+        var waitedMs = 0
+        while waitedMs <= 500 {
+            let first = AudioDeviceManager.inputStreamFormat(deviceID: inputID)
+            usleep(50_000)
+            waitedMs += 50
+            let second = AudioDeviceManager.inputStreamFormat(deviceID: inputID)
+            if let f = first, let s = second,
+               f.mSampleRate == s.mSampleRate,
+               f.mChannelsPerFrame == s.mChannelsPerFrame,
+               s.mSampleRate > 0, s.mChannelsPerFrame >= 1 {
+                asbd = s
+                break
+            }
         }
-        FileLog.log("start: input format \(inputFormat)")
+        guard let probed = asbd else {
+            FileLog.log("start: input format never stabilized within 500ms")
+            destroyAggregateIfNeeded()
+            throw NSError(domain: "MicProcessor", code: 23,
+                          userInfo: [NSLocalizedDescriptionKey: "The microphone is not ready yet. Try starting again in a few seconds."])
+        }
+        let inputRate = probed.mSampleRate
+        let inputChannels = Int(probed.mChannelsPerFrame)
+        let inputInterleaved = probed.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        FileLog.log("start: input format \(Int(inputRate)) Hz, \(inputChannels) ch \(inputInterleaved ? "interleaved" : "non-interleaved")")
 
-        let mixerNode = engine.mainMixerNode
-        engine.connect(engine.inputNode, to: unit, format: inputFormat)
-        engine.connect(unit, to: mixerNode, format: inputFormat)
-        engine.connect(mixerNode, to: engine.outputNode, format: nil)
+        // 5. RT context for the input callback, shaped to the PROBED
+        // format (no client format is ever set on the unit - macOS 26.2
+        // rejects it, and the device's own format is what arrives).
+        let context = MicCaptureContext(asbd: probed)
+        captureContext = context
 
-        // The engine's own output must never be audible. It exists only to
-        // keep the graph rendering; all real output goes through our own
-        // output unit below.
-        mixerNode.outputVolume = 0
+        // 6. Build the input unit (input element enabled, output
+        // disabled, pinned to the mic interface, input callback
+        // registered; NO client-format set).
+        let newInputUnit = try buildInputUnit(deviceID: inputID)
+        inputUnit = newInputUnit
 
-        setIsolationParameter(tapIsolation)
+        // 7. Build the isolation AU (mono float32 both scopes, render
+        // callback on the input scope). Fail-open: a build failure logs
+        // and leaves isolationAU nil - the chain runs WITHOUT isolation
+        // rather than failing the start.
+        isolationAU = buildIsolationAU(sampleRate: inputRate)
+        if let iso = isolationAU {
+            FileLog.log("mic: [isolation] armed at \(tapIsolation)")
+            AudioUnitSetParameter(iso, 0, kAudioUnitScope_Global, 0, tapIsolation, 0)
+        } else {
+            FileLog.log("mic: [isolation] unavailable, running WITHOUT isolation (fail-open)")
+        }
 
-        // Arm the clarity chain with the render rate.
-        voiceChain.configure(sampleRate: Float(inputFormat.sampleRate))
-        renderSampleRate = inputFormat.sampleRate
-
-        // Reset the ring before the engine starts so the tap (producer)
-        // never races the reset. Allocated once, reused forever.
+        // 8. Reset the ring BEFORE any producer/consumer starts (the
+        // input callback is the producer; it cannot run before step 9's
+        // start). Allocated once, reused forever.
         if ring == nil {
             ring = UnsafeMutablePointer<Float>.allocate(capacity: ringCapacity)
         }
         ringRead = 0
         ringWrite = 0
-        // The tap sits on the isolation unit (pre-mute) so the ring receives
-        // the processed signal regardless of where the engine routes its
-        // (silent) output.
-        installTap(on: unit, format: unit.outputFormat(forBus: 0))
 
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            FileLog.log("start: engine.start failed: \(error.localizedDescription)")
-            unit.removeTap(onBus: 0)
-            engine.detach(unit)
+        // Arm the clarity chain with the render rate.
+        voiceChain.configure(sampleRate: Float(inputRate))
+        renderSampleRate = inputRate
+
+        // 9. Initialize and start the input unit (bracketed; each call is
+        // park-capable and logged).
+        FileLog.log("mic: [input unit] initializing (park-capable)")
+        var st = AudioUnitInitialize(newInputUnit)
+        FileLog.log("mic: [input unit] initialized")
+        if st != noErr {
+            captureContext = nil
+            AudioComponentInstanceDispose(newInputUnit)
+            inputUnit = nil
+            if let iso = isolationAU { AudioUnitUninitialize(iso); AudioComponentInstanceDispose(iso) }
+            isolationAU = nil
             destroyAggregateIfNeeded()
-            isolationUnit = nil
-            throw error
+            throw AudioDeviceError.queryFailed(st)
         }
-        FileLog.log("start: engine started (muted)")
+        FileLog.log("mic: [input unit] starting (park-capable)")
+        st = AudioOutputUnitStart(newInputUnit)
+        FileLog.log("mic: [input unit] started")
+        if st != noErr {
+            AudioUnitUninitialize(newInputUnit)
+            AudioComponentInstanceDispose(newInputUnit)
+            inputUnit = nil
+            captureContext = nil
+            if let iso = isolationAU { AudioUnitUninitialize(iso); AudioComponentInstanceDispose(iso) }
+            isolationAU = nil
+            destroyAggregateIfNeeded()
+            throw AudioDeviceError.queryFailed(st)
+        }
+        FileLog.log("mic: [input unit] started, \(Int(inputRate)) Hz, \(inputChannels) ch, interleaved=\(inputInterleaved)")
 
-        // Feed the target device from the ring. If this fails there is no
-        // usable output path, so stop rather than run silently.
+        // 10. Feed the target device from the ring (unchanged). If this
+        // fails there is no usable output path, so stop rather than run
+        // silently.
         do {
-            try startOutputUnit(sampleRate: inputFormat.sampleRate)
+            try startOutputUnit(sampleRate: inputRate)
         } catch {
             FileLog.log("start: output unit failed: \(error.localizedDescription)")
             stopLocked()
@@ -307,12 +510,12 @@ final class MicProcessor {
         // Keep macOS from napping the app while audio flows: App Nap
         // throttles main-thread timers, which would show up as growing
         // meter lag over long sessions. System idle sleep stays allowed;
-        // the wake handler rebuilds the engine after real sleep.
+        // the wake handler rebuilds the pipeline after real sleep.
         activity = ProcessInfo.processInfo.beginActivity(
             options: .userInitiatedAllowingIdleSystemSleep,
             reason: "Szept audio pipeline active"
         )
-        logger.notice("MicProcessor started; engine muted, dedicated output unit running")
+        logger.notice("MicProcessor started; dedicated HAL input + output units running")
     }
 
     func stop() {
@@ -322,25 +525,48 @@ final class MicProcessor {
     }
 
     /// stop() body; caller holds lifecycleLock. Idempotent: also callable
-    /// from the start-failure path, where isRunning is still false but a
-    /// live engine must be torn down.
+    /// from the start-failure path, where isRunning is still false but
+    /// live units must be torn down.
     private func stopLocked() {
         FileLog.log("stop: tearing down (isRunning=\(isRunning))")
 
         stopOutputUnit()
 
+        // 2. Stop, uninitialize, and dispose the input unit (bracketed;
+        // each call is park-capable and logged).
+        if let unit = inputUnit {
+            FileLog.log("mic: [input unit] stopping (park-capable)")
+            AudioOutputUnitStop(unit)
+            FileLog.log("mic: [input unit] stopped")
+            FileLog.log("mic: [input unit] uninitializing (park-capable)")
+            AudioUnitUninitialize(unit)
+            FileLog.log("mic: [input unit] uninitialized")
+            FileLog.log("mic: [input unit] disposing (park-capable)")
+            AudioComponentInstanceDispose(unit)
+            inputUnit = nil
+            FileLog.log("mic: [input unit] disposed")
+        }
+
+        // 3. Uninitialize and dispose the isolation AU, with the RT
+        // diagnostics (logged only now: the unit is stopped, so no
+        // concurrent writer remains).
+        if let iso = isolationAU {
+            if let ctx = captureContext {
+                if ctx.isolationStatus != 0 || ctx.overflowCount != 0 || ctx.renderStatus != 0 {
+                    FileLog.log("mic: [isolation] renderStatus=\(ctx.renderStatus), isolationStatus=\(ctx.isolationStatus), overflowCount=\(ctx.overflowCount)")
+                }
+            }
+            FileLog.log("mic: [isolation] uninitializing (park-capable)")
+            AudioUnitUninitialize(iso)
+            FileLog.log("mic: [isolation] disposing (park-capable)")
+            AudioComponentInstanceDispose(iso)
+            isolationAU = nil
+            FileLog.log("mic: [isolation] disposed")
+        }
+        captureContext = nil
+
         // Output unit first, then the aggregate it pointed at.
         destroyAggregateIfNeeded()
-
-        isolationUnit?.removeTap(onBus: 0)
-        engine.stop()
-
-        if let unit = isolationUnit {
-            engine.disconnectNodeInput(unit)
-            engine.disconnectNodeOutput(unit)
-            engine.detach(unit)
-            isolationUnit = nil
-        }
 
         isRunning = false
         stopMeterTimer()
@@ -469,50 +695,208 @@ final class MicProcessor {
     }
 
     private func setIsolationParameter(_ value: Float) {
-        guard let au = isolationUnit?.audioUnit else { return }
+        guard let au = isolationAU else { return }
         AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, value, 0)
     }
 
-    // MARK: - Device selection
+    // MARK: - Dedicated input unit + isolation AU (builders)
 
-    private func setDevice(_ deviceID: AudioDeviceID, on node: AVAudioIONode) throws {
-        guard let au = node.audioUnit else {
+    /// Build the HAL input unit: input element enabled, output element
+    /// disabled (aurioTouch / QA1533 pattern), pinned to the mic
+    /// interface, input callback registered. NO client format is set:
+    /// macOS 26.2's HAL unit rejects client formats on the input element
+    /// outright (kAudioUnitErr_PropertyNotWritable, -10865), and none is
+    /// needed - the unit delivers the DEVICE'S OWN stream format, the
+    /// same one the probe read and the context preallocates for. No
+    /// format negotiation: no converter, no validator, nothing for
+    /// Apple's render-path validation to trip over. Every mutation is
+    /// FileLog-bracketed (park-capable). Failure at any step disposes
+    /// what was created before throwing.
+    private func buildInputUnit(deviceID: AudioDeviceID) throws -> AudioComponentInstance {
+        FileLog.log("mic: [input unit] finding HALOutput component (park-capable)")
+        var desc = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0, componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &desc) else {
             throw NSError(domain: "MicProcessor", code: 12,
-                          userInfo: [NSLocalizedDescriptionKey: "Audio IO node has no underlying audio unit"])
+                          userInfo: [NSLocalizedDescriptionKey: "HALOutput audio component not found"])
         }
-        var id = deviceID
-        let status = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
-                                          kAudioUnitScope_Global, 0, &id,
-                                          UInt32(MemoryLayout<AudioDeviceID>.size))
-        guard status == noErr else {
-            throw NSError(domain: "MicProcessor", code: 10,
-                          userInfo: [NSLocalizedDescriptionKey: "Failed to select audio device (code \(status))"])
+        FileLog.log("mic: [input unit] creating component instance (park-capable)")
+        var newUnit: AudioComponentInstance?
+        let newStatus = AudioComponentInstanceNew(component, &newUnit)
+        FileLog.log("mic: [input unit] component instance created")
+        guard newStatus == noErr, let unit = newUnit else {
+            throw AudioDeviceError.queryFailed(newStatus)
         }
+
+        // Input-only wiring: enable the input element (scope Input,
+        // element 1), disable the output element (scope Output, element
+        // 0). The unit therefore contributes NO client on the default
+        // output (I1/I6).
+        var enableIO: UInt32 = 1
+        var disableIO: UInt32 = 0
+        FileLog.log("mic: [input unit] enabling input element (park-capable)")
+        var st = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size)
+        )
+        guard st == noErr else {
+            AudioComponentInstanceDispose(unit)
+            throw AudioDeviceError.queryFailed(st)
+        }
+        FileLog.log("mic: [input unit] disabling output element (park-capable)")
+        st = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Output, 0, &disableIO, UInt32(MemoryLayout<UInt32>.size)
+        )
+        guard st == noErr else {
+            AudioComponentInstanceDispose(unit)
+            throw AudioDeviceError.queryFailed(st)
+        }
+
+        var device = deviceID
+        FileLog.log("mic: [input unit] pinning device (park-capable)")
+        st = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 0, &device,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        FileLog.log("mic: [input unit] pin done")
+        guard st == noErr else {
+            AudioComponentInstanceDispose(unit)
+            throw AudioDeviceError.queryFailed(st)
+        }
+
+        // The input callback, refCon via passUnretained (the processor
+        // owns the context and disposes the unit before dropping it).
+        var callbackStruct = AURenderCallbackStruct(
+            inputProc: micInputCallback,
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        st = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_SetInputCallback,
+            kAudioUnitScope_Input, 1, &callbackStruct,
+            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        )
+        guard st == noErr else {
+            AudioComponentInstanceDispose(unit)
+            throw AudioDeviceError.queryFailed(st)
+        }
+        return unit
     }
 
-    // MARK: - Tap (producer)
-
-    private func installTap(on node: AVAudioNode, format: AVAudioFormat) {
-        node.removeTap(onBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            FileLog.log("tap: invalid format \(format)")
-            return
+    /// Build the AUSoundIsolation instance: mono float32 in BOTH scopes
+    /// (the probed rate), render callback on the input scope feeding it
+    /// from the capture context, then Initialize. Returns nil on ANY
+    /// failure (fail-open: the pipeline runs without isolation), after
+    /// disposing whatever was created.
+    private func buildIsolationAU(sampleRate: Double) -> AudioComponentInstance? {
+        var desc = Self.isolationDescription
+        guard let component = AudioComponentFindNext(nil, &desc) else {
+            FileLog.log("mic: [isolation] component not found")
+            return nil
         }
-        node.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.processTap(buffer: buffer)
+        FileLog.log("mic: [isolation] creating component instance (park-capable)")
+        var newUnit: AudioComponentInstance?
+        let newStatus = AudioComponentInstanceNew(component, &newUnit)
+        FileLog.log("mic: [isolation] component instance created")
+        guard newStatus == noErr, let unit = newUnit else {
+            FileLog.log("mic: [isolation] creation failed (\(newStatus))")
+            return nil
         }
+        // Mono float32, non-interleaved: 4 bytes per frame/packet is one
+        // channel's sample.
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kLinearPCMFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var st = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 0, &asbd,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        guard st == noErr else {
+            FileLog.log("mic: [isolation] input format rejected (\(st))")
+            AudioComponentInstanceDispose(unit)
+            return nil
+        }
+        st = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output, 0, &asbd,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        guard st == noErr else {
+            FileLog.log("mic: [isolation] output format rejected (\(st))")
+            AudioComponentInstanceDispose(unit)
+            return nil
+        }
+        var callbackStruct = AURenderCallbackStruct(
+            inputProc: isolationInputCallback,
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        st = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_SetRenderCallback,
+            kAudioUnitScope_Input, 0, &callbackStruct,
+            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        )
+        guard st == noErr else {
+            FileLog.log("mic: [isolation] render callback rejected (\(st))")
+            AudioComponentInstanceDispose(unit)
+            return nil
+        }
+        FileLog.log("mic: [isolation] initializing (park-capable)")
+        st = AudioUnitInitialize(unit)
+        FileLog.log("mic: [isolation] initialized")
+        guard st == noErr else {
+            FileLog.log("mic: [isolation] initialize failed (\(st))")
+            AudioComponentInstanceDispose(unit)
+            return nil
+        }
+        return unit
     }
 
-    // Runs on the engine's render thread. Must not allocate or block.
-    private nonisolated func processTap(buffer: AVAudioPCMBuffer) {
-        guard let channelData = buffer.floatChannelData?[0] else { return }
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return }
+    // MARK: - Capture processing (RT, input unit's render thread)
+
+    /// Runs on the input unit's render thread via micInputCallback. Must
+    /// not allocate or block. Semantics identical to the old
+    /// processTap: meter on the raw input, voice-mute gate, isolation
+    /// render (fail-open), voice chain, soft limiter, ring push.
+    fileprivate nonisolated func processCapture(frames: Int, timestamp: UnsafePointer<AudioTimeStamp>) {
+        guard let context = captureContext else { return }
+        let inABL = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.inListPtr))
+        )
+        guard inABL.count > 0, let inData = inABL[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+        let mono = context.inMono
+        if context.interleaved, context.channels > 1 {
+            let stride = context.stride
+            var i = 0
+            while i < frames {
+                mono[i] = inData[i * stride]
+                i += 1
+            }
+        } else {
+            var i = 0
+            while i < frames {
+                mono[i] = inData[i]
+                i += 1
+            }
+        }
 
         // Meter FIRST, on the raw input: while muted the meter stays live
         // and shows the level you WOULD be sending. tapCount keeps ticking
         // too, so the meter-stall diagnostic cannot false-positive.
-        let rms = DSP.calculateRMS(samples: channelData, count: frameCount)
+        let rms = DSP.calculateRMS(samples: mono, count: frames)
         meterLevel = rms
         tapCount &+= 1
 
@@ -523,11 +907,34 @@ final class MicProcessor {
         // discarded work.
         guard !voiceMuted else { return }
 
-        // Post-chain signal feeds the ring.
-        voiceChain.process(channelData, count: frameCount)
-        DSP.applySoftLimiter(samples: channelData, count: frameCount, threshold: 0.7)
+        // Isolation render: pull the AU's output (the pull invokes
+        // isolationInputCallback on the input scope). Timestamps are the
+        // context's monotonically advancing sample counter - NO clock
+        // calls in RT. On error: FAIL-OPEN passthrough (the unprocessed
+        // mono signal continues down the chain) and record the status.
+        var out = mono
+        if let iso = isolationAU {
+            context.framePosition += Double(frames)
+            var ts = AudioTimeStamp()
+            ts.mSampleTime = context.framePosition
+            ts.mFlags = AudioTimeStampFlags.audioTimeStampSampleTimeValid
+            var renderFlags = AudioUnitRenderActionFlags()
+            let outList = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.outListPtr))
+            let status = AudioUnitRender(iso, &renderFlags, &ts, 0, UInt32(frames), outList)
+            if status == noErr {
+                let outABL = UnsafeMutableAudioBufferListPointer(outList)
+                if let rendered = outABL[0].mData?.assumingMemoryBound(to: Float.self) {
+                    out = rendered
+                }
+            } else {
+                context.isolationStatus = status
+            }
+        }
 
-        pushToRing(samples: channelData, count: frameCount)
+        // Post-chain signal feeds the ring.
+        voiceChain.process(out, count: frames)
+        DSP.applySoftLimiter(samples: out, count: frames, threshold: 0.7)
+        pushToRing(samples: out, count: frames)
     }
 
     /// Main thread. Mutes only the VOICE leg; system-audio sharing (if
@@ -564,7 +971,7 @@ final class MicProcessor {
         guard let outputID = outputDeviceID else { return }
 
         // Input leg: the pinned device, or the system default input when
-        // the user never picked one. The engine itself stays unpinned.
+        // the user never picked one. The input unit gets the same resolution.
         let inputID: AudioDeviceID
         if let pinned = inputDeviceID {
             inputID = pinned
@@ -819,7 +1226,7 @@ final class MicProcessor {
         }
         // System-audio mix point. This runs in the OUTPUT-UNIT render path
         // (drainRing), after the sample/zero-fill loops, NOT in
-        // processTap/pushToRing (the mic producer): system audio must
+        // processCapture/pushToRing (the mic producer): system audio must
         // bypass the entire mic filter chain (isolation/clarity/limiter)
         // and land on top of the already-processed voice. Only when frames
         // were actually mixed do we re-limit: the mic leg is limited at 0.7

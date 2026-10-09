@@ -11,15 +11,17 @@ import AudioUnit
 /// OFF across launches; only the previous-output UID is saved, as
 /// operational state for crash recovery.
 ///
-/// Deadlock invariant (I1): the MIC engine is UNPINNED, so its muted
-/// output unit is an implicit HAL client of whatever the default output
-/// is. The share teardown therefore stops the mic engine BEFORE destroying
-/// the multi-output (see performTeardown): destroying a device an audio
-/// unit still references can deadlock main in AVAudioEngine dealloc
-/// against a wedged HAL plugin. Round 10: the share capture side
-/// contributes NO default-output client - it is an input-only HAL unit
-/// (output element disabled) with no render graph, so the only engine
-/// that must respect the stop order is the mic processor's.
+/// Deadlock invariant (I1): round 11 - the MIC path no longer
+/// contributes ANY default-output client either: its input unit is
+/// pinned to the mic interface and its output unit is pinned to its own
+/// target, so the stop-before-destroy ordering is retained only as belt
+/// and braces. Historically the mic engine was UNPINNED, so its muted
+/// output unit was an implicit HAL client of whatever the default output
+/// was, and the share teardown had to stop it BEFORE destroying the
+/// multi-output (destroying a device an audio unit still references can
+/// deadlock a teardown against a wedged HAL plugin). Round 10: the share
+/// capture side contributes NO default-output client - it is an
+/// input-only HAL unit (output element disabled) with no render graph.
 ///
 /// Hang invariant (I5): no engine/HAL mutation API is ever called on main
 /// once launch cleanup has run (cleanupStaleDevices is the sanctioned
@@ -357,7 +359,7 @@ final class SystemAudioSharer {
     /// 4. arm the mix bus, using the probe's capture rate (after unit
     ///    start; safe because pushes no-op into an unarmed bus = silence)
     /// 5. create the multi-output (speakers main, BlackHole member)
-    /// 6. suppression window, flip the default output to the multi-output
+    /// 6. flip the default output to the multi-output
     /// 7. isSharing = true (last)
     @MainActor
     func enable(micProcessor: MicProcessor) async throws {
@@ -445,7 +447,7 @@ final class SystemAudioSharer {
     /// generation means the watchdog already gave up on us, so we roll
     /// back quietly and flip nothing.
     private func performEnable(_ gen: Int, _ micProcessor: MicProcessor) {
-        var step = "suppression"
+        var step = "cooldown"
         var multiOutputID: AudioDeviceID?
         var memberDeviceID: AudioDeviceID?
         var defaultFlipped = false
@@ -474,14 +476,6 @@ final class SystemAudioSharer {
         armWatchdog(gen)
 
         do {
-            // Suppression FIRST, before any default-output flip this call
-            // may trigger (including the stale-cleanup restore in step 3):
-            // the window is time-based, so opening it early is harmless and
-            // closing it late is impossible to get wrong. The write is
-            // main-confined; the async hop costs microseconds, well inside
-            // the 1.5s window.
-            DispatchQueue.main.async { self.beginSuppression() }
-
             step = "resolve BlackHole"
             // 1. Prefer BlackHole 16ch by name; fall back to any other
             // BlackHole that is not the mic engine's own output device and
@@ -639,12 +633,10 @@ final class SystemAudioSharer {
             if isStale(gen) { return rollbackStaleWorker(gen: gen, step: step, defaultFlipped: false, unit: unit, context: context, multiOutputID: multiOutputID, memberDeviceID: memberDeviceID) }
 
             step = "flip default output"
-            // 6. Suppression window again: flipping the default output makes
-            // the mic engine's muted output unit fire a configuration change
-            // that would otherwise trigger a full mic rebuild
-            // mid-presentation. The window self-expires (~1.5s); it is never
-            // closed early so the async change lands inside it.
-            DispatchQueue.main.async { self.beginSuppression() }
+            // 6. Flip the default output to the multi-output. The mic path
+            // has no engine and every unit is pinned to its own target
+            // (I6), so this flip is structurally invisible to the rest of
+            // the pipeline.
             FileLog.log("share: [flip default output] flipping (park-capable)")
             try AudioDeviceManager.setDefaultOutputDevice(id: createdID)
             defaultFlipped = true
@@ -1080,10 +1072,10 @@ final class SystemAudioSharer {
         // default). Zero live clients must remain before the destroy.
         var micWasStopped = false
         if cycleMic, micProcessor?.isRunning == true {
-            FileLog.log("share: [\(reason)] stopping mic engine before multi-output destroy (park-capable)")
+            FileLog.log("share: [\(reason)] stopping mic units before multi-output destroy (park-capable)")
             micProcessor?.stop()
             micWasStopped = true
-            FileLog.log("share: [\(reason)] mic engine stopped before multi-output destroy")
+            FileLog.log("share: [\(reason)] mic units stopped before multi-output destroy")
         }
 
         // 3. Restore the default only if we still own it: the user may have
@@ -1096,10 +1088,9 @@ final class SystemAudioSharer {
             FileLog.log("share: [\(reason)] default output restored")
         }
 
-        // 4. Re-arm suppression around the restore flip, mirroring the
-        // enable flip: it equally fires the mic engine's configuration
-        // change when the mic engine is still running (cycleMic=false).
-        DispatchQueue.main.async { self.beginSuppression() }
+        // 4. (Removed: the suppression window. The mic path has no engine
+        // and no default-output client, so the restore flip cannot trigger
+        // a rebuild - see invariant I6.)
 
         // 5. Destroy the multi-output (now unreferenced).
         if let id = multiOutputID {
@@ -1335,20 +1326,5 @@ final class SystemAudioSharer {
         }
         try? AudioDeviceManager.setDefaultOutputDevice(id: device.id)
         FileLog.log("share: default output restored to \(uid)")
-    }
-
-    // MARK: - Suppression window
-
-    /// Owns the timestamp the lifecycle observer checks. Main thread only
-    /// (worker writes hop to main; the hop costs microseconds, well inside
-    /// the window).
-    private var suppressionUntil = Date.distantPast
-    private static let suppressionInterval: TimeInterval = 1.5
-
-    var isSuppressingRebuild: Bool { Date() < suppressionUntil }
-
-    /// Open the window around the default-output flip + capture unit start.
-    private func beginSuppression() {
-        suppressionUntil = Date().addingTimeInterval(Self.suppressionInterval)
     }
 }

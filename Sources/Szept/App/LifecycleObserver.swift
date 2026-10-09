@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import AVFoundation
 import CoreAudio
 
 /// Maps a failed engine start to a user-facing message. Raw OSStatus codes
@@ -33,7 +32,6 @@ final class LifecycleObserver {
     init(appState: AppState) {
         self.appState = appState
         observeSleepWake()
-        observeEngineConfiguration()
         observeDeviceList()
         // Prime the snapshot (raw device IDs, with our own created devices
         // excluded by ID: the mic aggregate and the share multi-output) so
@@ -153,35 +151,20 @@ final class LifecycleObserver {
 
     // MARK: - Device changes
 
-    /// The engine signals that its configuration changed (device vanished,
-    /// format change, default device switch). Observed with object nil so it
-    /// keeps working across engine recreations inside MicProcessor.start().
-    private func observeEngineConfiguration() {
-        let token = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let self, let appState = self.appState else { return }
-            // Round 10: the share capture path has no AVAudioEngine any
-            // more (a bare HAL input unit posts no configuration-change
-            // notification), so there is no share-engine identity branch -
-            // every notification here is the mic engine's.
-            // Self-inflicted change from the sharer's default-output flip (see SystemAudioSharer.enable step 6): suppress, don't rebuild.
-            if appState.systemSharer.isSuppressingRebuild {
-                FileLog.log("lifecycle: rebuild suppressed (self-inflicted)")
-                return
-            }
-            guard appState.micProcessor.isRunning else { return }
-            FileLog.log("device: configuration changed")
-            self.scheduleRebuild(reason: "engine configuration change")
-        }
-        observerTokens.append(token)
-    }
+    // Sole rebuild trigger: the device-list watchdog. There is no
+    // engine-configuration observer - the app contains ZERO AVAudioEngines
+    // (invariant I6), so .AVAudioEngineConfigurationChange can never fire,
+    // and default-output changes no longer affect the mic path at all
+    // (every unit is pinned to its own target). Input-device loss is
+    // covered by the device-list rebuild below. Known gap: a mid-session
+    // input FORMAT change (the interface renegotiated under us) degrades
+    // until restart - the capture context is shaped to the start-time
+    // probe, and the callback fail-opens to silence on a shape mismatch.
+    // A kAudioUnitProperty_StreamFormat listener is parked as a follow-up.
 
     /// Coarse HAL signal that the device list changed (USB blip, coreaudiod
-    /// restart). Routed through the same debounced rebuild as the engine
-    /// notification so a burst of events causes one rebuild, not many.
+    /// restart). Routed through the debounced rebuild so a burst of events
+    /// causes one rebuild, not many.
     private func observeDeviceList() {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
