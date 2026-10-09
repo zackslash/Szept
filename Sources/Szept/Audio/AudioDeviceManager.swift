@@ -454,6 +454,13 @@ final class AudioDeviceManager {
 
     /// Set a device's nominal sample rate. Best effort by design: callers
     /// read the rate back instead of trusting the set.
+    ///
+    /// Round 9: MIC-PATH-ONLY now - the sharer no longer sets the
+    /// BlackHole's rate (the rate set manufactures a device
+    /// reconfiguration whose trailing realloc was the round-9 prod crash).
+    /// This helper carries the same trailing-realloc risk class on
+    /// MicProcessor's fallback-direct path (alignDeviceSampleRate); the
+    /// prod log will adjudicate before that path changes.
     static func setNominalSampleRate(deviceID: AudioDeviceID, to rate: Double, logPrefix: String) {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,

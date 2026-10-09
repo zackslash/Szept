@@ -52,8 +52,10 @@ final class SystemMixBus {
 
     /// Called on the share queue (enable's arm step). Allocate the ring on
     /// first use and reset the bridge.
-    /// `inputRate` is the capture tap rate (BlackHole, pinned to 48 kHz by
-    /// the sharer), `outputRate` the mic engine's render rate.
+    /// `inputRate` is the capture tap rate - the BlackHole's NATIVE rate
+    /// (round 9: the sharer no longer pins it to 48 kHz; any ratio is
+    /// handled by the servo, within the sharer's ratio guard), `outputRate`
+    /// the mic engine's render rate.
     func arm(inputRate: Double, outputRate: Double) {
         if ring == nil {
             ring = UnsafeMutablePointer<Float>.allocate(capacity: capacity)

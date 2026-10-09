@@ -71,6 +71,15 @@ import CoreAudio
 /// auto-retry), never in a connect. The watchdog is epoch-guarded so each
 /// re-arm (including the code-38 retry's) gets a fresh budget instead of a
 /// pending stale timer false-wedging the longer legitimate path.
+///
+/// Round 9 (prod crash fix): the last manufactured reconfiguration is
+/// gone - the sharer no longer calls setNominalSampleRate (the rate set's
+/// trailing realloc was the round-9 crash class). Capture follows the
+/// device's NATIVE rate: the input-ASBD probe is the SOLE rate authority,
+/// the mix bus arms after engine start with the probed capture rate, and
+/// a ratio guard (captureRate/renderRate within [0.75, 1.5], code 39)
+/// bounds the servo's linear-SRC operating range instead of aliasing on
+/// an exotic leftover rate.
 @Observable
 final class SystemAudioSharer {
 
@@ -178,11 +187,13 @@ final class SystemAudioSharer {
     /// bounded cooldown to supervise real work. The capture engine is
     /// built and started BEFORE the multi-output exists, pinned to the
     /// STANDALONE BlackHole device, so the engine never has a reference to
-    /// a device being created/destroyed under it:
-    /// 1. resolve BlackHole 16ch (required) and pin it to 48 kHz
-    /// 2. arm the mix bus for the two clocks
-    /// 3. save the current default output UID (stale-share cleanup first)
-    /// 4. build + start the capture engine pinned to the standalone BlackHole
+    /// a device being created/destroyed under it (round-9 order):
+    /// 1. resolve BlackHole 16ch (required); NO rate set - capture follows
+    ///    the device's native rate
+    /// 2. save the current default output UID (stale-share cleanup first)
+    /// 3. build + start the capture engine pinned to the standalone BlackHole
+    /// 4. arm the mix bus, using the probe's capture rate (after engine
+    ///    start; safe because pushes no-op into an unarmed bus = silence)
     /// 5. create the multi-output (speakers main, BlackHole member)
     /// 6. suppression window, flip the default output to the multi-output
     /// 7. isSharing = true (last)
@@ -341,34 +352,13 @@ final class SystemAudioSharer {
                                   ? "BlackHole 16ch is in use as the Szept output device. Install a second BlackHole (2ch or 16ch) for system-audio sharing."
                                   : "BlackHole 16ch not installed (brew install --cask blackhole-16ch)"])
             }
-            FileLog.log("share: [resolve BlackHole] setting nominal rate (park-capable)")
-            AudioDeviceManager.setNominalSampleRate(deviceID: blackHole.id, to: 48000,
-                                                    logPrefix: "share")
-            FileLog.log("share: [resolve BlackHole] nominal rate set")
-            // Rate settle: our own rate set manufactures a device
-            // reconfiguration; the pin in step 4 triggers it again. Poll
-            // until the device reports 48 kHz (up to 500ms) so the pin does
-            // not race the reconfiguration.
-            var waitedMs = 0
-            while AudioDeviceManager.nominalSampleRate(deviceID: blackHole.id) != 48000,
-                  waitedMs < 500 {
-                usleep(50_000)
-                waitedMs += 50
-            }
-            if waitedMs > 0 {
-                FileLog.log("share: [\(step)] rate settling, waited \(waitedMs)ms")
-            }
-
-            step = "arm mix bus"
-            // 2. Arm the mix bus: capture at the BH16 rate we actually got
-            // (read back after the best-effort 48k pin; the pin can fail),
-            // render at the mic processor's output rate. Active flag is set
-            // last (barrier inside).
-            let inRate = AudioDeviceManager.nominalSampleRate(deviceID: blackHole.id) ?? 48000
-            let renderRate = micProcessor.renderSampleRate ?? 48000
-            let armedRate = renderRate
-            publishIfCurrent(gen) { self.armedRenderRate = armedRate }
-            mixBus.arm(inputRate: inRate, outputRate: renderRate)
+            // Round 9: NO rate set. The setNominalSampleRate + settle loop
+            // is gone - it was the last manufactured reconfiguration (the
+            // round-9 prod crash class: rate-set trailing realloc). Capture
+            // follows the device's native rate instead; the probe in
+            // startCaptureEngine is the sole rate authority.
+            let deviceRate = AudioDeviceManager.nominalSampleRate(deviceID: blackHole.id) ?? 48000
+            FileLog.log("share: [resolve BlackHole] capturing at device rate \(Int(deviceRate)) Hz (no rate set)")
 
             step = "save previous output"
             // 3. Persist the current default output. If the current default
@@ -394,14 +384,15 @@ final class SystemAudioSharer {
             }
 
             step = "start capture engine"
-            // 4. Build + start the capture engine pinned to the STANDALONE
+            // 3. Build + start the capture engine pinned to the STANDALONE
             // BlackHole, before the multi-output exists. One retry after a
             // 250 ms settle for residual races. The retry catches
             // HAL-REFUSED THROWS only: a park does not throw, it just never
             // returns; the watchdog owns those.
             self.micProcessor = micProcessor
+            var captureRate: Double = 48000
             do {
-                engine = try startCaptureEngine(blackHoleID: blackHole.id)
+                (engine, captureRate) = try startCaptureEngine(blackHoleID: blackHole.id)
             } catch {
                 if (error as NSError).code == 38 {
                     // Probe refusal: one in-band 2s auto-retry; see
@@ -417,7 +408,7 @@ final class SystemAudioSharer {
                     discardPartialEngine(label: step)
                     usleep(250_000)
                 }
-                engine = try startCaptureEngine(blackHoleID: blackHole.id)
+                (engine, captureRate) = try startCaptureEngine(blackHoleID: blackHole.id)
             }
             // The grace clock starts at engine start, so it also covers the
             // multi-output creation + default flip below.
@@ -428,6 +419,27 @@ final class SystemAudioSharer {
                 throw NSError(domain: "Szept", code: 33,
                               userInfo: [NSLocalizedDescriptionKey: "Capture engine did not start"])
             }
+
+            step = "arm mix bus"
+            // 4. Arm the mix bus AFTER the engine start (round 9 reorder):
+            // single rate authority - captureRate comes from the probe's
+            // ASBD (the stream the tap actually delivers), not from a
+            // separate nominalSampleRate read (the latent disagreement this
+            // kills). Arming this late is safe: the tap's push no-ops while
+            // the ring is nil (guard let ring), drainRing cannot mix before
+            // the active flag flips; the few ms of capture that landed in a
+            // not-yet-armed bus are silence. The ratio guard bounds the
+            // linear-SRC servo's operating range instead of aliasing on an
+            // exotic leftover rate.
+            let renderRate = micProcessor.renderSampleRate ?? 48000
+            let ratio = captureRate / renderRate
+            if !(0.75...1.5).contains(ratio) {
+                throw NSError(domain: "Szept", code: 39,
+                              userInfo: [NSLocalizedDescriptionKey: "BlackHole is set to \(Int(captureRate)) Hz while your mic runs at \(Int(renderRate)) Hz. Set BlackHole's rate to match in Audio MIDI Setup, then share."])
+            }
+            let armedRate = renderRate
+            publishIfCurrent(gen) { self.armedRenderRate = armedRate }
+            mixBus.arm(inputRate: captureRate, outputRate: renderRate)
 
             // STALE GATE 1: the watchdog may have abandoned this worker
             // while the engine start parked. Before creating anything new,
@@ -626,9 +638,10 @@ final class SystemAudioSharer {
     /// Build, pin, wire, and start the share capture engine. Runs on
     /// shareQueue. Every park-capable call is bracketed with FileLog lines
     /// so a post-mortem shows exactly which call parked. Returns the
-    /// started engine; the identity is already published on main
-    /// (currentEngine) before prepare/start.
-    private func startCaptureEngine(blackHoleID: AudioDeviceID) throws -> AVAudioEngine {
+    /// started engine plus the probe's ASBD rate (the SOLE rate authority:
+    /// the stream the tap actually delivers); the identity is already
+    /// published on main (currentEngine) before prepare/start.
+    private func startCaptureEngine(blackHoleID: AudioDeviceID) throws -> (engine: AVAudioEngine, captureRate: Double) {
         FileLog.log("share: [start capture engine] creating AVAudioEngine (park-capable)")
         let engine = AVAudioEngine()
         FileLog.log("share: [start capture engine] engine created")
@@ -659,9 +672,11 @@ final class SystemAudioSharer {
         // pin+start. The private-mini-aggregate escape hatch (building a
         // tiny throwaway aggregate around the BlackHole to satisfy picky
         // HAL states) is deliberately NOT adopted; use it only if a retest
-        // shows pin/start failure on the quiescent device. The settle wait
-        // in step 1 shrinks the manufactured-reconfiguration window this
-        // pin triggers (hang #2's park class).
+        // shows pin/start failure on the quiescent device. (Round 9: the
+        // settle wait that used to live in step 1 is gone with the rate
+        // set - there is no longer a manufactured reconfiguration for this
+        // pin to race; the post-teardown cooldown and the probe cover the
+        // residual windows.)
         var bhID = blackHoleID
         FileLog.log("share: [start capture engine] pinning device (park-capable)")
         let pinStatus = AudioUnitSetProperty(
@@ -732,7 +747,7 @@ final class SystemAudioSharer {
         FileLog.log("share: [start capture engine] prepared, starting (park-capable)")
         try engine.start()
         FileLog.log("share: [start capture engine] engine started on BlackHole id \(blackHoleID)")
-        return engine
+        return (engine, rate)
     }
 
     // MARK: - Disable
@@ -902,9 +917,19 @@ final class SystemAudioSharer {
             }
         }
 
-        // 7. Restart the mic engine if this teardown stopped it (on main).
+        // 7. Restart the mic engine if this teardown stopped it (on main),
+        // DEFERRED past the churn window (round 9): v0.4.0's working
+        // re-enable path made mic cycles much more frequent, and a restart
+        // firing immediately at teardown end lands INSIDE the unstack
+        // churn window (>3.5s per rounds 4-5), which makes the mic
+        // aggregate creation fail and fall back to direct two-clock
+        // routing - the drift-blip mechanism. The 1.5s defer puts the
+        // aggregate create on a settled HAL; the extra gap rides the
+        // existing cycle gap. Sleep/terminate pass restartMic: false and
+        // are unaffected.
         if restartMic, micWasStopped {
-            DispatchQueue.main.async {
+            FileLog.log("share: mic restart deferred 1.5s (post-churn settle)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 self.restartMicAfterShareTeardown?()
             }
         }
