@@ -786,6 +786,23 @@ final class SystemAudioSharer {
     /// ASBD rate (the SOLE rate authority: the stream the callback
     /// actually delivers).
     private func startCaptureUnit(blackHoleID: AudioDeviceID) throws -> (unit: AudioComponentInstance, context: CaptureContext, captureRate: Double) {
+        // (0) Sole rate/channel authority: the stability probe, run BEFORE
+        // any client exists on the device. Ordering is load-bearing: an
+        // input-only client with no client format set (macOS 26.2 rejects
+        // client-format sets) makes the HAL derive a DEGENERATE 1ch input
+        // stream for the pinned device after a multi-output teardown -
+        // pinned probes read that phantom and refuse forever (verified
+        // 2026-10-09: pinned probe read "48000 Hz 1 ch" cycle after cycle
+        // while the SAME property, read unpinned with no clients, reported
+        // a healthy 16 ch). Unpinned, the probe still does its real job:
+        // gate on sanity and stability, throw on failure - no fallback.
+        let probed = try probeStableInputFormat(deviceID: blackHoleID)
+        let rate = probed.asbd.mSampleRate
+        let channels = Int(probed.asbd.mChannelsPerFrame)
+        let interleaved = probed.asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        let source = probed.source
+        FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native, no client format set")
+
         // (1) Component resolution + instance creation.
         FileLog.log("share: [start capture unit] finding HALOutput component (park-capable)")
         var desc = AudioComponentDescription(
@@ -853,20 +870,9 @@ final class SystemAudioSharer {
             throw AudioDeviceError.queryFailed(st)
         }
 
-        // (4) Sole rate/channel authority: the stability probe. It gates
-        // the client-format application below until the device's input
-        // ASBD is sane and stable, and it THROWS on failure - there is no
-        // fallback ladder. History note: v0.4.1 capped the WIRING format
-        // at 2ch because AVAudioFormat's constructor refused >2ch standard
-        // float formats on macOS 26.2 (the bd45765 converter edge); the
-        // raw-ASBD route below has no such limit, so the full probed
-        // channel count is wired.
-        let probed = try probeStableInputFormat(deviceID: blackHoleID)
-        let rate = probed.asbd.mSampleRate
-        let channels = Int(probed.asbd.mChannelsPerFrame)
-        let interleaved = probed.asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-        let source = probed.source
-        FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native, no client format set")
+        // (4) Probe ran as step (0), before any client pinned the device
+        // (see the ordering rationale there). The probed channel count
+        // shaped the context below.
 
         // (5) No ASBD to build: macOS 26.2's HAL unit rejects client
         // formats on the input element outright (kAudioUnitErr_PropertyNotWritable,
