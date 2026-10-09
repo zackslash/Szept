@@ -131,9 +131,16 @@ fileprivate let micInputCallback: AURenderCallback = { refCon, _, inTimeStamp, _
     }
     var renderFlags = AudioUnitRenderActionFlags()
     let list = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.inListPtr))
-    let status = AudioUnitRender(
-        unit, &renderFlags, inTimeStamp, 1, UInt32(frames), list
+    // Diagnostic batch: bus 0 first (suspected 26.2 element rebinding),
+    // bus 1 fallback. Whichever succeeds wins.
+    var status = AudioUnitRender(
+        unit, &renderFlags, inTimeStamp, 0, UInt32(frames), list
     )
+    if status != noErr {
+        status = AudioUnitRender(
+            unit, &renderFlags, inTimeStamp, 1, UInt32(frames), list
+        )
+    }
     if status != noErr {
         context.renderStatus = status
         return noErr
@@ -761,15 +768,26 @@ final class MicProcessor {
         }
 
         // Input-only wiring: enable the input element (scope Input,
-        // element 1), disable the output element (scope Output, element
-        // 0). The unit therefore contributes NO client on the default
-        // output (I1/I6).
+        // element 1 - the aurioTouch convention), disable the output
+        // element (scope Output, element 0). The unit therefore
+        // contributes NO client on the default output (I1/I6).
+        // DIAGNOSTIC BATCH 2026-10-09: all input units deliver zeros
+        // while callbacks fire and renders return noErr - suspected
+        // element rebinding on macOS 26.2 (input streams on element 0,
+        // element 1 an empty stub that accepts formats and renders
+        // zeros). Input IO is enabled on BOTH elements and the render
+        // tries bus 0 first; the teardown log reports which bus
+        // delivered data.
         var enableIO: UInt32 = 1
         var disableIO: UInt32 = 0
         FileLog.log("mic: [input unit] enabling input element (park-capable)")
         var st = AudioUnitSetProperty(
             unit, kAudioOutputUnitProperty_EnableIO,
             kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size)
+        )
+        _ = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Input, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size)
         )
         guard st == noErr else {
             AudioComponentInstanceDispose(unit)
@@ -798,12 +816,13 @@ final class MicProcessor {
             throw AudioDeviceError.queryFailed(st)
         }
 
-        // CLIENT FORMAT (input scope, element 1): configures the device's
-        // input stream for this client. Without it the IO cycle runs and
-        // the callback fires, but the stream is never configured and every
+        // CLIENT FORMAT (input scope): configures the device's input
+        // stream for this client. Without it the IO cycle runs and the
+        // callback fires, but the stream is never configured and every
         // buffer is zeros (see startLocked step 6 note). Must be the
         // PROBED device-native ASBD verbatim - HAL units do no conversion
-        // and reject non-native variants (-10865).
+        // and reject non-native variants (-10865). Set on BOTH elements
+        // (diagnostic batch: element rebinding suspected on 26.2).
         var cfmt = clientFormat
         FileLog.log("mic: [input unit] setting client format (park-capable)")
         st = AudioUnitSetProperty(
@@ -811,8 +830,15 @@ final class MicProcessor {
             kAudioUnitScope_Input, 1, &cfmt,
             UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         )
-        FileLog.log("mic: [input unit] client format set: \(st)")
-        guard st == noErr else {
+        FileLog.log("mic: [input unit] client format set (el 1): \(st)")
+        var cfmt0 = clientFormat
+        let st0 = AudioUnitSetProperty(
+            unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 0, &cfmt0,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        FileLog.log("mic: [input unit] client format set (el 0): \(st0)")
+        guard st == noErr || st0 == noErr else {
             AudioComponentInstanceDispose(unit)
             throw AudioDeviceError.queryFailed(st)
         }
