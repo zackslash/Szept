@@ -163,14 +163,10 @@ final class LifecycleObserver {
             queue: .main
         ) { [weak self] notification in
             guard let self, let appState = self.appState else { return }
-            // Object-identity check FIRST: a configuration change on the
-            // share capture engine is the sharer's problem, not a mic
-            // rebuild trigger.
-            if let engine = notification.object as? AVAudioEngine,
-               engine === appState.systemSharer.currentEngine {
-                appState.systemSharer.handleEngineConfigChange()
-                return
-            }
+            // Round 10: the share capture path has no AVAudioEngine any
+            // more (a bare HAL input unit posts no configuration-change
+            // notification), so there is no share-engine identity branch -
+            // every notification here is the mic engine's.
             // Self-inflicted change from the sharer's default-output flip (see SystemAudioSharer.enable step 6): suppress, don't rebuild.
             if appState.systemSharer.isSuppressingRebuild {
                 FileLog.log("lifecycle: rebuild suppressed (self-inflicted)")
