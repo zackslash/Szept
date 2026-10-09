@@ -109,7 +109,6 @@ fileprivate final class CaptureContext {
     /// here so the callback's ownership story is one object. Written once
     /// at build time (before the callback can ever run: the refCon is
     /// registered in the same build sequence), read-only in the callback.
-    nonisolated(unsafe) var unit: AudioComponentInstance?
     let channels: Int
     let mixBus: SystemMixBus
 
@@ -122,6 +121,18 @@ fileprivate final class CaptureContext {
     let bufferListPtr: UnsafeMutableRawPointer
     let capacityFrames: UInt32 = 4096
     let interleaved: Bool
+    /// Total byte capacity of the capture data area. The raw IOProc
+    /// path clamps its copy against it.
+    var capacityBytes: Int { Int(capacityFrames) * channels * 4 }
+    /// The capture list's DATA area (first buffer's mData) - the raw
+    /// IOProc copies device bytes here, leaving the list header intact
+    /// for the callback's layout-aware walk.
+    var dataPtr: UnsafeMutableRawPointer {
+        let abl = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer<AudioBufferList>(OpaquePointer(bufferListPtr))
+        )
+        return abl[0].mData!
+    }
 
     /// Scratch deinterleave targets for the interleaved path (ch0/ch1
     /// strided out before the mix-bus push). Preallocated: RT no-alloc.
@@ -132,13 +143,10 @@ fileprivate final class CaptureContext {
     /// logged only in stopCaptureUnit AFTER the unit is stopped (so no
     /// concurrent writer remains). Nonisolated(unsafe) by design; the
     /// write/read ordering is the unit lifetime itself.
-    nonisolated(unsafe) var lastRenderStatus: OSStatus = 0
+    /// True when the capture IOProc saw no data at all (frames clamped
+    /// to zero across the session) - diagnostics only. Written by the
+    /// RT callback, read after AudioDeviceStop (no concurrent writer).
     nonisolated(unsafe) var overflowCount: Int = 0
-    /// Per-render error COUNT (lastRenderStatus only keeps the last
-    /// code). A start transient errors once; a real shape mismatch
-    /// (cached format stale) errors on EVERY render and hits 100 within
-    /// ~2s of audio - that is the signal that clears the format cache.
-    nonisolated(unsafe) var renderErrorCount: Int = 0
 
     init(channels: Int, interleaved: Bool, mixBus: SystemMixBus) {
         self.channels = channels
@@ -193,43 +201,42 @@ fileprivate final class CaptureContext {
     }
 }
 
-/// The share capture render callback: a STORED C function pointer, NOT a
-/// closure over self (no context capture means no ObjC, no allocation, no
-/// locking on the RT thread). Renders bus 1 element 0 into the context's
-/// preallocated list, then pushes into the mix bus's lock-free ring. On
-/// AudioUnitRender error: record lastRenderStatus and return noErr -
-/// never fail the unit over one bad render.
-fileprivate let captureInputCallback: AURenderCallback = { refCon, _, inTimeStamp, _, inNumberFrames, _ -> OSStatus in
-    let context = Unmanaged<CaptureContext>.fromOpaque(refCon).takeUnretainedValue()
-    guard let captureUnit = context.unit else { return noErr }
-    // Clamp to the preallocated capacity; count the overflow instead of
-    // growing (RT: no allocation).
-    let frames = Int(inNumberFrames)
-    var clipped = false
-    var frameCount = frames
-    if frames > Int(context.capacityFrames) {
-        frameCount = Int(context.capacityFrames)
-        clipped = true
-    }
-    var renderFlags = AudioUnitRenderActionFlags()
-    let list = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.bufferListPtr))
-    let status = AudioUnitRender(
-        captureUnit,
-        &renderFlags, inTimeStamp, 1, UInt32(frameCount), list
+/// Opaque handle for a live share capture: the raw HAL IOProc and its
+device.
+fileprivate struct ShareCaptureHandle {
+    let ioProc: AudioDeviceIOProcID
+    let device: AudioDeviceID
+}
+
+/// The share capture IOProc: a STORED C function pointer, NOT a
+/// closure (no context capture means no ObjC, no allocation, no
+/// locking on the RT thread). The raw HAL device IOProc receives the
+/// BlackHole's input buffer list DIRECTLY (input AudioUnits deliver
+/// zeros on macOS 26.2 - see the mic path's micIOProc note); the bytes
+/// are copied into the context's preallocated data area, strided into
+/// ch0/ch1, and pushed into the mix bus's lock-free ring.
+fileprivate let captureIOProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, clientData -> OSStatus in
+    guard let clientData else { return noErr }
+    let context = Unmanaged<CaptureContext>.fromOpaque(clientData).takeUnretainedValue()
+    let abl = UnsafeMutableAudioBufferListPointer(
+        UnsafeMutablePointer(mutating: inInputData)
     )
-    if status != noErr {
-        context.lastRenderStatus = status
-        context.renderErrorCount += 1
-        return noErr
+    guard abl.count > 0, let data = abl[0].mData else { return noErr }
+    let byteCount = min(Int(abl[0].mDataByteSize), context.capacityBytes)
+    if byteCount > 0 {
+        context.dataPtr.copyMemory(from: data, byteCount: byteCount)
     }
-    if clipped {
+    let frames = byteCount / 4 / max(1, context.channels)
+    guard frames > 0 else { return noErr }
+    if frames > Int(context.capacityFrames) {
         context.overflowCount += 1
     }
-    guard frameCount > 0 else { return noErr }
-    let abl = UnsafeMutableAudioBufferListPointer(list)
-    guard abl.count > 0, let data = abl[0].mData?.assumingMemoryBound(to: Float.self) else {
+    let list = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.bufferListPtr))
+    let parsed = UnsafeMutableAudioBufferListPointer(list)
+    guard parsed.count > 0, let samples = parsed[0].mData?.assumingMemoryBound(to: Float.self) else {
         return noErr
     }
+    let frameCount = min(frames, Int(context.capacityFrames))
     if context.interleaved {
         // BlackHole's native shape: one buffer, channels interleaved.
         // Stride ch0/ch1 out into the preallocated scratch pair (RT:
@@ -240,18 +247,18 @@ fileprivate let captureInputCallback: AURenderCallback = { refCon, _, inTimeStam
             let r = context.scratchR
             var i = 0
             while i < frameCount {
-                l[i] = data[i * stride]
-                r[i] = data[i * stride + 1]
+                l[i] = samples[i * stride]
+                r[i] = samples[i * stride + 1]
                 i += 1
             }
             context.mixBus.pushStereo(ch0: l, ch1: r, count: frameCount)
         } else {
-            context.mixBus.push(samples: data, count: frameCount)
+            context.mixBus.push(samples: samples, count: frameCount)
         }
-    } else if context.channels >= 2, abl.count > 1, let ch1 = abl[1].mData?.assumingMemoryBound(to: Float.self) {
-        context.mixBus.pushStereo(ch0: data, ch1: ch1, count: frameCount)
+    } else if context.channels >= 2, parsed.count > 1, let ch1 = parsed[1].mData?.assumingMemoryBound(to: Float.self) {
+        context.mixBus.pushStereo(ch0: samples, ch1: ch1, count: frameCount)
     } else {
-        context.mixBus.push(samples: data, count: frameCount)
+        context.mixBus.push(samples: samples, count: frameCount)
     }
     return noErr
 }
@@ -318,9 +325,9 @@ final class SystemAudioSharer {
     /// written by performEnable on shareQueue after a successful start,
     /// read and cleared by performDisable/performTeardown on the SAME
     /// serial queue - no hops, no races. (Round 10: replaces the
-    /// main-published currentEngine; an AudioComponentInstance is an
+    /// main-published currentEngine; a capture handle is an
     /// opaque pointer, so there is nothing to dealloc-transfer.)
-    private var activeUnit: AudioComponentInstance?
+    private var activeUnit: ShareCaptureHandle?
     private var activeContext: CaptureContext?
 
     private(set) var multiOutputID: AudioDeviceID?
@@ -454,7 +461,7 @@ final class SystemAudioSharer {
         // The worker's own capture unit + context. startCaptureUnit
         // returns a started unit or throws, so every stale gate below sees
         // it non-nil (bound non-optionally after the retry block).
-        var unit: AudioComponentInstance?
+        var unit: ShareCaptureHandle?
         var context: CaptureContext?
 
         // Cooldown sleep per lastTeardownCompletedAt's doc (the canonical
@@ -673,7 +680,7 @@ final class SystemAudioSharer {
                 }
             }
         }
-        // An AudioComponentInstance is an opaque pointer: dropping the
+        // A capture handle is a value type: dropping the
         // worker frame's copy deallocates NOTHING. There is no engine
         // dealloc park class here; disposal is explicit and bracketed in
         // performTeardown above.
@@ -715,7 +722,7 @@ final class SystemAudioSharer {
     /// that, and the queue-confined activeUnit/activeContext are cleared
     /// inside performTeardown when they match.
     private func rollbackStaleWorker(gen: Int, step: String, defaultFlipped: Bool,
-                                     unit: AudioComponentInstance,
+                                     unit: ShareCaptureHandle,
                                      context: CaptureContext,
                                      multiOutputID: AudioDeviceID?,
                                      memberDeviceID: AudioDeviceID?) {
@@ -801,7 +808,7 @@ final class SystemAudioSharer {
     /// parked. Returns the started unit, its RT context, and the probe's
     /// ASBD rate (the SOLE rate authority: the stream the callback
     /// actually delivers).
-    private func startCaptureUnit(blackHoleID: AudioDeviceID) throws -> (unit: AudioComponentInstance, context: CaptureContext, captureRate: Double) {
+    private func startCaptureUnit(blackHoleID: AudioDeviceID) throws -> (capture: ShareCaptureHandle, context: CaptureContext, captureRate: Double) {
         // (0) Rate/channel authority. FIRST enable in a fresh process:
         // probe the device object (sane, stable read). Every LATER enable:
         // use the persisted cache. Ordering and caching are both
@@ -839,161 +846,35 @@ final class SystemAudioSharer {
             FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native")
         }
 
-        // (1) Component resolution + instance creation.
-        FileLog.log("share: [start capture unit] finding HALOutput component (park-capable)")
-        var desc = AudioComponentDescription(
-            componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
-            componentManufacturer: kAudioUnitManufacturer_Apple,
-            componentFlags: 0, componentFlagsMask: 0
-        )
-        guard let component = AudioComponentFindNext(nil, &desc) else {
-            throw NSError(domain: "Szept", code: 33,
-                          userInfo: [NSLocalizedDescriptionKey: "HALOutput audio component not found"])
-        }
-        FileLog.log("share: [start capture unit] creating component instance (park-capable)")
-        var newUnit: AudioComponentInstance?
-        let newInstanceStatus = AudioComponentInstanceNew(component, &newUnit)
-        FileLog.log("share: [start capture unit] component instance created")
-        guard newInstanceStatus == noErr, let halUnit = newUnit else {
-            throw AudioDeviceError.queryFailed(newInstanceStatus)
-        }
-
-        // (2) Input-only wiring: aurioTouch / QA1533 pattern - enable the
-        // input element (scope Input, element 1), disable the output
-        // element (scope Output, element 0). buildOutputUnit in
-        // MicProcessor's world is the mirror image. The share unit
-        // therefore contributes NO client on the default output (I1).
-        var enableIO: UInt32 = 1
-        var disableIO: UInt32 = 0
-        FileLog.log("share: [start capture unit] enabling input element (park-capable)")
-        var st = AudioUnitSetProperty(
-            halUnit, kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size)
-        )
-        guard st == noErr else {
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-        FileLog.log("share: [start capture unit] disabling output element (park-capable)")
-        st = AudioUnitSetProperty(
-            halUnit, kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Output, 0, &disableIO, UInt32(MemoryLayout<UInt32>.size)
-        )
-        guard st == noErr else {
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-
-        // (3) Pin to the STANDALONE BlackHole. Direct device open on a
-        // quiescent device nothing references yet is universally supported
-        // for a pin+start. The private-mini-aggregate escape hatch is
-        // deliberately NOT adopted; use it only if a retest shows pin/start
-        // failure on the quiescent device. (Round 9: the settle wait that
-        // used to live in step 1 is gone with the rate set - there is no
-        // manufactured reconfiguration for this pin to race; the
-        // post-teardown cooldown and the probe cover the residual windows.)
-        var bhID = blackHoleID
-        FileLog.log("share: [start capture unit] pinning device (park-capable)")
-        st = AudioUnitSetProperty(
-            halUnit, kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global, 0, &bhID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        FileLog.log("share: [start capture unit] pin done")
-        guard st == noErr else {
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-
-        // (4) Probe ran as step (0), before any client pinned the device
-        // (see the ordering rationale there). The probed channel count
-        // shaped the context below.
-
-        // (5) CLIENT FORMAT: the device-native ASBD reconstructed from
-        // the probed/cached values, VERBATIM flags included.
-        // Load-bearing (verified via the mic path's in-app dump): a
-        // format-less input unit's IO runs and its callback fires, but
-        // the stream is never configured and every buffer is zeros.
-        // HAL units accept only device-native formats - the round-10
-        // -10865 rejection was a NON-NATIVE ASBD (non-interleaved
-        // against BH16's native interleaved), not a macOS rule. If the
-        // set is rejected here, fall back format-less and log loudly
-        // (capture will deliver zeros - a visible defect, not a silent
-        // one).
-        var cfmt = AudioStreamBasicDescription(
-            mSampleRate: rate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: formatFlags,
-            mBytesPerPacket: UInt32(4 * channels),
-            mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(4 * channels),
-            mChannelsPerFrame: UInt32(channels),
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-        FileLog.log("share: [start capture unit] setting client format (park-capable)")
-        let fmtSt = AudioUnitSetProperty(
-            halUnit, kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input, 1, &cfmt,
-            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        )
-        FileLog.log("share: [start capture unit] client format set: \(fmtSt)")
-        if fmtSt != noErr {
-            FileLog.log("share: [start capture unit] client format REJECTED (\(fmtSt)) - capture will deliver zeros until fixed")
-        }
-
-        // (6) The input callback, refCon via passUnretained (the sharer
-        // owns the context and disposes the unit before dropping it).
+        // (1) Create the raw HAL input IOProc on the BlackHole (no
+        // AudioUnit: input AudioUnits deliver zeros on macOS 26.2 -
+        // see captureIOProc's doc and the mic path's micIOProc). The
+        // IOProc receives the device's input buffer list directly.
         let context = CaptureContext(channels: channels, interleaved: interleaved, mixBus: mixBus)
-        context.unit = halUnit
-        var callbackStruct = AURenderCallbackStruct(
-            inputProc: captureInputCallback,
-            inputProcRefCon: Unmanaged.passUnretained(context).toOpaque()
+        FileLog.log("share: [start capture] creating IOProc (park-capable)")
+        var newProc: AudioDeviceIOProcID?
+        let procStatus = AudioDeviceCreateIOProcID(
+            blackHoleID, captureIOProc,
+            Unmanaged.passUnretained(context).toOpaque(),
+            &newProc
         )
-        st = AudioUnitSetProperty(
-            halUnit, kAudioOutputUnitProperty_SetInputCallback,
-            kAudioUnitScope_Input, 1, &callbackStruct,
-            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
-        )
-        guard st == noErr else {
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
+        FileLog.log("share: [start capture] IOProc created: \(procStatus)")
+        guard procStatus == noErr, let ioProc = newProc else {
+            throw AudioDeviceError.queryFailed(procStatus)
         }
 
-        // (7) NO client-format set: macOS 26.2's HAL unit rejects client
-        // formats on the input element outright (kAudioUnitErr_PropertyNotWritable,
-        // verified empirically; the engine-era connect did this work under
-        // the hood and is where the prod crash lived). The unit delivers
-        // the DEVICE'S OWN stream format by default - the same one the
-        // probe read and the context preallocated for - so there is
-        // nothing to negotiate: no converter, no validator, no mismatch.
-        // If the device's format ever shifts under us mid-flight, the
-        // callback's AudioUnitRender reports it and we degrade to silence
-        // (lastRenderStatus) rather than crash.
-
-        // (8) Initialize the unit.
-        FileLog.log("share: [start capture unit] initializing unit (park-capable)")
-        st = AudioUnitInitialize(halUnit)
-        FileLog.log("share: [start capture unit] unit initialized")
-        guard st == noErr else {
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
+        // (2) Start the device IO cycle.
+        FileLog.log("share: [start capture] starting device (park-capable)")
+        let startStatus = AudioDeviceStart(blackHoleID, ioProc)
+        FileLog.log("share: [start capture] device started: \(startStatus)")
+        guard startStatus == noErr else {
+            AudioDeviceDestroyIOProcID(blackHoleID, ioProc)
+            throw AudioDeviceError.queryFailed(startStatus)
         }
 
-        // (9) Start pulling (replaces engine.start()).
-        FileLog.log("share: [start capture unit] starting unit (park-capable)")
-        st = AudioOutputUnitStart(halUnit)
-        FileLog.log("share: [start capture unit] unit started")
-        guard st == noErr else {
-            AudioUnitUninitialize(halUnit)
-            AudioComponentInstanceDispose(halUnit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-
-        // (10)
-        FileLog.log("share: [start capture unit] started, \(Int(rate)) Hz \(channels) ch")
-        return (halUnit, context, rate)
+        // (3)
+        FileLog.log("share: [start capture] live, \(Int(rate)) Hz \(channels) ch")
+        return (ShareCaptureHandle(ioProc: ioProc, device: blackHoleID), context, rate)
     }
 
     // MARK: - Disable
@@ -1084,12 +965,12 @@ final class SystemAudioSharer {
     ///   multi-output, so it must not be stopped.
     private func performTeardown(gen: Int, reason: String,
                                  restartMic: Bool, cycleMic: Bool,
-                                 unit: AudioComponentInstance?,
+                                 unit: ShareCaptureHandle?,
                                  context: CaptureContext?,
                                  multiOutputID: AudioDeviceID?,
                                  memberDeviceID: AudioDeviceID?) {
         // 1. Stop and dispose the share capture unit (explicit, bracketed;
-        // an AudioComponentInstance is an opaque pointer - no dealloc
+        // a capture handle is a value type - no dealloc
         // transfer story exists).
         stopCaptureUnit(unit: unit, context: context, label: reason)
         if activeUnit == unit { activeUnit = nil }
@@ -1172,47 +1053,28 @@ final class SystemAudioSharer {
 
     /// Stop and discard a half-built unit + context from a failed start
     /// attempt (before the retry). Runs on shareQueue.
-    private func discardPartialUnit(unit: AudioComponentInstance?,
+    private func discardPartialUnit(unit: ShareCaptureHandle?,
                                     context: CaptureContext?, label: String) {
         guard let unit else { return }
         stopCaptureUnit(unit: unit, context: context, label: label)
-        FileLog.log("share: [\(label)] partial capture unit discarded")
+        FileLog.log("share: [\(label)] partial capture discarded")
     }
 
-    /// Stop, uninitialize, and dispose a share capture unit, with park
-    /// brackets around every HAL call, then log the callback's health
-    /// counters (written by the RT callback, read only here - the unit is
+    /// Stop and destroy a share capture IOProc, with park brackets
+    /// around every HAL call, then log the callback's health counters
+    /// (written by the RT callback, read only here - the device is
     /// already stopped, so no concurrent writer remains). Runs on
     /// shareQueue.
-    private func stopCaptureUnit(unit: AudioComponentInstance?,
+    private func stopCaptureUnit(unit: ShareCaptureHandle?,
                                  context: CaptureContext?, label: String) {
         guard let unit else { return }
-        FileLog.log("share: [\(label)] stopping capture unit (park-capable)")
-        let stopStatus = AudioOutputUnitStop(unit)
-        FileLog.log("share: [\(label)] capture unit stopped")
-        if stopStatus == noErr {
-            FileLog.log("share: [\(label)] uninitializing capture unit (park-capable)")
-            AudioUnitUninitialize(unit)
-            FileLog.log("share: [\(label)] capture unit uninitialized")
-            FileLog.log("share: [\(label)] disposing capture unit (park-capable)")
-            AudioComponentInstanceDispose(unit)
-            FileLog.log("share: [\(label)] capture unit disposed")
-        }
+        FileLog.log("share: [\(label)] stopping capture device (park-capable)")
+        let stopStatus = AudioDeviceStop(unit.device, unit.ioProc)
+        FileLog.log("share: [\(label)] capture device stopped: \(stopStatus)")
+        FileLog.log("share: [\(label)] destroying IOProc (park-capable)")
+        AudioDeviceDestroyIOProcID(unit.device, unit.ioProc)
+        FileLog.log("share: [\(label)] IOProc destroyed")
         if let context {
-            if context.lastRenderStatus != 0 {
-                FileLog.log("share: [\(label)] capture renders errored \(context.lastRenderStatus) during session (\(context.renderErrorCount) renders)")
-                if context.lastRenderStatus == -50 && context.renderErrorCount > 100 {
-                    // paramErr on MOST renders = the delivered stream shape
-                    // mismatched the allocated context: the cached format
-                    // is stale (e.g. the device was reconfigured in Audio
-                    // MIDI Setup). A single -50 is a known start transient
-                    // (first pull before the device streams) and must NOT
-                    // clear the cache - doing so re-exposes every later
-                    // enable to the poisoned in-process format read.
-                    UserDefaults.standard.removeObject(forKey: "shareCaptureFormatCache")
-                    FileLog.log("share: [\(label)] capture format cache cleared (persistent shape mismatch)")
-                }
-            }
             if context.overflowCount > 0 {
                 FileLog.log("share: [\(label)] capture buffer overflowed \(context.overflowCount) times during session")
             }
