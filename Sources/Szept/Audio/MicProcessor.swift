@@ -20,6 +20,18 @@ fileprivate final class MicCaptureContext {
     /// buffer (== channels); 1 in the non-interleaved walk.
     let stride: Int
     let capacityFrames: UInt32 = 4096
+    /// Total byte capacity of the input data area (frames x channels x
+    /// 4 for float32). The raw IOProc path clamps its copy against it.
+    var capacityBytes: Int { Int(capacityFrames) * channels * 4 }
+    /// The input list's DATA area (first buffer's mData) - the raw
+    /// IOProc copies device bytes here, leaving the list header intact
+    /// for processCapture's layout-aware walk.
+    var inDataPtr: UnsafeMutableRawPointer {
+        let abl = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer<AudioBufferList>(OpaquePointer(inListPtr))
+        )
+        return abl[0].mData!
+    }
 
     /// Preallocated input list, shaped to the PROBED device format:
     /// interleaved -> a single buffer of `channels` x 4096 frames;
@@ -112,41 +124,33 @@ fileprivate final class MicCaptureContext {
     }
 }
 
-/// The mic input callback: a STORED C function pointer, NOT a closure
-/// over self (no context capture means no ObjC, no allocation, no
-/// locking on the RT thread). refCon is the MicProcessor (same pattern
-/// as drainRing's refCon). Renders bus 1 element 0 into the context's
-/// preallocated input list, then hands off to processCapture. On
-/// AudioUnitRender error: record renderStatus and return noErr - never
-/// fail the unit over one bad render.
-fileprivate let micInputCallback: AURenderCallback = { refCon, _, inTimeStamp, _, inNumberFrames, _ -> OSStatus in
-    let processor = Unmanaged<MicProcessor>.fromOpaque(refCon).takeUnretainedValue()
-    guard let unit = processor.inputUnit, let context = processor.captureContext else { return noErr }
-    // Clamp to the preallocated capacity; count the overflow instead of
-    // growing (RT: no allocation).
-    var frames = Int(inNumberFrames)
-    if frames > Int(context.capacityFrames) {
-        frames = Int(context.capacityFrames)
-        context.overflowCount += 1
-    }
-    var renderFlags = AudioUnitRenderActionFlags()
-    let list = UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.inListPtr))
-    // Diagnostic batch: bus 0 first (suspected 26.2 element rebinding),
-    // bus 1 fallback. Whichever succeeds wins.
-    var status = AudioUnitRender(
-        unit, &renderFlags, inTimeStamp, 0, UInt32(frames), list
+/// Raw HAL device IOProc for mic capture: a STORED C function pointer
+/// (no closure capture - no ObjC, no allocation, no locking on the RT
+/// thread). Replaces the input-unit approach entirely: every
+/// element/scope/format combination of an input-only HALOutput
+/// AudioUnit delivered zeros on macOS 26.2 while callbacks fired and
+/// renders returned noErr (in-app dump verified); the device-level
+/// IOProc receives the input buffer list DIRECTLY from the HAL - no
+/// unit, no elements, no client formats. Copies the device bytes into
+/// the context's preallocated data area, then hands off to
+/// processCapture.
+fileprivate let micIOProc: AudioDeviceIOProc = { clientData, _, inInputData, _, _, _ -> OSStatus in
+    let processor = Unmanaged<MicProcessor>.fromOpaque(clientData).takeUnretainedValue()
+    guard let context = processor.captureContext else { return noErr }
+    guard let inInputData else { return noErr }
+    let abl = UnsafeMutableAudioBufferListPointer(
+        UnsafeMutablePointer(mutating: inInputData)
     )
-    if status != noErr {
-        status = AudioUnitRender(
-            unit, &renderFlags, inTimeStamp, 1, UInt32(frames), list
-        )
+    guard abl.count > 0, let data = abl[0].mData else { return noErr }
+    let byteCount = min(Int(abl[0].mDataByteSize), context.capacityBytes)
+    if byteCount > 0 {
+        context.inDataPtr.copyMemory(from: data, byteCount: byteCount)
     }
-    if status != noErr {
-        context.renderStatus = status
-        return noErr
-    }
+    let frames = byteCount / 4 / max(1, context.stride)
     guard frames > 0 else { return noErr }
-    processor.processCapture(frames: frames, timestamp: inTimeStamp)
+    var ts = AudioTimeStamp()
+    ts.mFlags = .sampleTimeValid
+    processor.processCapture(frames: frames, timestamp: &ts)
     return noErr
 }
 
@@ -298,7 +302,7 @@ final class MicProcessor {
 
     // The mic pipeline has NO AVAudioEngine (invariant I6 below): input
     // capture is a dedicated HALOutput unit pinned to the mic interface,
-    // feeding the ring through micInputCallback, and the AUSoundIsolation
+    // feeding the ring through the mic IOProc, and the AUSoundIsolation
     // effect is a dedicated AudioComponentInstance pulled manually from
     // processCapture. The dedicated output unit (below) is unchanged. All
     // IO is HAL units with explicit lifecycles, so the engine's graph
@@ -330,13 +334,14 @@ final class MicProcessor {
     /// The dedicated HAL input unit (HALOutput, input element enabled,
     /// pinned to the mic interface). Built in startLocked, disposed in
     /// stopLocked. File-accessible for the C callbacks in this file.
-    nonisolated(unsafe) fileprivate var inputUnit: AudioComponentInstance?
+    nonisolated(unsafe) fileprivate var inputIOProcID: AudioDeviceIOProcID?
+    nonisolated(unsafe) fileprivate var inputIOProcDevice: AudioDeviceID?
     /// The dedicated AUSoundIsolation instance, mono float32 in both
     /// scopes, pulled manually by processCapture. Nil = fail-open (the
     /// voice chain runs WITHOUT isolation; logged at start).
     nonisolated(unsafe) fileprivate var isolationAU: AudioComponentInstance?
-    /// RT state for micInputCallback (see the context's doc at the top
-    /// of the file). Non-nil only while inputUnit is live.
+    /// RT state for the mic IOProc (see the context's doc at the top
+    /// of the file). Non-nil only while the input IOProc is live.
     nonisolated(unsafe) fileprivate var captureContext: MicCaptureContext?
 
     private var outputUnit: AudioComponentInstance?
@@ -471,8 +476,25 @@ final class MicProcessor {
         // "-10865 rejects client formats" finding was wrong in general -
         // the unit rejects NON-NATIVE formats; the verbatim probed ASBD
         // is accepted.
-        let newInputUnit = try buildInputUnit(deviceID: inputID, clientFormat: probed)
-        inputUnit = newInputUnit
+        // 6. Create the raw HAL input IOProc on the device (no AudioUnit:
+        // every input-unit configuration delivered zeros on macOS 26.2 -
+        // see micIOProc's doc). The IOProc receives the device's input
+        // buffer list directly from the HAL.
+        FileLog.log("mic: [input ioproc] creating (park-capable)")
+        var newIOProc: AudioDeviceIOProcID?
+        let ioprocStatus = AudioDeviceCreateIOProcID(
+            inputID, micIOProc,
+            Unmanaged.passUnretained(self).toOpaque(),
+            nil, &newIOProc
+        )
+        FileLog.log("mic: [input ioproc] created: \(ioprocStatus)")
+        guard ioprocStatus == noErr, let theProc = newIOProc else {
+            captureContext = nil
+            destroyAggregateIfNeeded()
+            throw AudioDeviceError.queryFailed(ioprocStatus)
+        }
+        inputIOProcID = theProc
+        inputIOProcDevice = inputID
 
         // 7. Build the isolation AU (mono float32 both scopes, render
         // callback on the input scope). Fail-open: a build failure logs
@@ -499,34 +521,21 @@ final class MicProcessor {
         voiceChain.configure(sampleRate: Float(inputRate))
         renderSampleRate = inputRate
 
-        // 9. Initialize and start the input unit (bracketed; each call is
-        // park-capable and logged).
-        FileLog.log("mic: [input unit] initializing (park-capable)")
-        var st = AudioUnitInitialize(newInputUnit)
-        FileLog.log("mic: [input unit] initialized")
+        // 9. Start the device IO cycle (bracketed; park-capable).
+        FileLog.log("mic: [input ioproc] starting device (park-capable)")
+        var st = AudioDeviceStart(inputID, theProc)
+        FileLog.log("mic: [input ioproc] device started: \(st)")
         if st != noErr {
-            captureContext = nil
-            AudioComponentInstanceDispose(newInputUnit)
-            inputUnit = nil
-            if let iso = isolationAU { AudioUnitUninitialize(iso); AudioComponentInstanceDispose(iso) }
-            isolationAU = nil
-            destroyAggregateIfNeeded()
-            throw AudioDeviceError.queryFailed(st)
-        }
-        FileLog.log("mic: [input unit] starting (park-capable)")
-        st = AudioOutputUnitStart(newInputUnit)
-        FileLog.log("mic: [input unit] started")
-        if st != noErr {
-            AudioUnitUninitialize(newInputUnit)
-            AudioComponentInstanceDispose(newInputUnit)
-            inputUnit = nil
+            AudioDeviceDestroyIOProcID(inputID, theProc)
+            inputIOProcID = nil
+            inputIOProcDevice = nil
             captureContext = nil
             if let iso = isolationAU { AudioUnitUninitialize(iso); AudioComponentInstanceDispose(iso) }
             isolationAU = nil
             destroyAggregateIfNeeded()
             throw AudioDeviceError.queryFailed(st)
         }
-        FileLog.log("mic: [input unit] started, \(Int(inputRate)) Hz, \(inputChannels) ch, interleaved=\(inputInterleaved)")
+        FileLog.log("mic: [input ioproc] live, \(Int(inputRate)) Hz, \(inputChannels) ch, interleaved=\(inputInterleaved)")
 
         // 10. Feed the target device from the ring (unchanged). If this
         // fails there is no usable output path, so stop rather than run
@@ -567,19 +576,16 @@ final class MicProcessor {
 
         stopOutputUnit()
 
-        // 2. Stop, uninitialize, and dispose the input unit (bracketed;
-        // each call is park-capable and logged).
-        if let unit = inputUnit {
-            FileLog.log("mic: [input unit] stopping (park-capable)")
-            AudioOutputUnitStop(unit)
-            FileLog.log("mic: [input unit] stopped")
-            FileLog.log("mic: [input unit] uninitializing (park-capable)")
-            AudioUnitUninitialize(unit)
-            FileLog.log("mic: [input unit] uninitialized")
-            FileLog.log("mic: [input unit] disposing (park-capable)")
-            AudioComponentInstanceDispose(unit)
-            inputUnit = nil
-            FileLog.log("mic: [input unit] disposed")
+        // 2. Stop and destroy the input IOProc (bracketed; park-capable).
+        if let proc = inputIOProcID, let dev = inputIOProcDevice {
+            FileLog.log("mic: [input ioproc] stopping device (park-capable)")
+            let stopSt = AudioDeviceStop(dev, proc)
+            FileLog.log("mic: [input ioproc] device stopped: \(stopSt)")
+            FileLog.log("mic: [input ioproc] destroying (park-capable)")
+            AudioDeviceDestroyIOProcID(dev, proc)
+            FileLog.log("mic: [input ioproc] destroyed")
+            inputIOProcID = nil
+            inputIOProcDevice = nil
         }
 
         // 3. Uninitialize and dispose the isolation AU, with the RT
@@ -747,125 +753,6 @@ final class MicProcessor {
     /// Apple's render-path validation to trip over. Every mutation is
     /// FileLog-bracketed (park-capable). Failure at any step disposes
     /// what was created before throwing.
-    private func buildInputUnit(deviceID: AudioDeviceID, clientFormat: AudioStreamBasicDescription) throws -> AudioComponentInstance {
-        FileLog.log("mic: [input unit] finding HALOutput component (park-capable)")
-        var desc = AudioComponentDescription(
-            componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
-            componentManufacturer: kAudioUnitManufacturer_Apple,
-            componentFlags: 0, componentFlagsMask: 0
-        )
-        guard let component = AudioComponentFindNext(nil, &desc) else {
-            throw NSError(domain: "MicProcessor", code: 12,
-                          userInfo: [NSLocalizedDescriptionKey: "HALOutput audio component not found"])
-        }
-        FileLog.log("mic: [input unit] creating component instance (park-capable)")
-        var newUnit: AudioComponentInstance?
-        let newStatus = AudioComponentInstanceNew(component, &newUnit)
-        FileLog.log("mic: [input unit] component instance created")
-        guard newStatus == noErr, let unit = newUnit else {
-            throw AudioDeviceError.queryFailed(newStatus)
-        }
-
-        // Input-only wiring: enable the input element (scope Input,
-        // element 1 - the aurioTouch convention), disable the output
-        // element (scope Output, element 0). The unit therefore
-        // contributes NO client on the default output (I1/I6).
-        // DIAGNOSTIC BATCH 2026-10-09: all input units deliver zeros
-        // while callbacks fire and renders return noErr - suspected
-        // element rebinding on macOS 26.2 (input streams on element 0,
-        // element 1 an empty stub that accepts formats and renders
-        // zeros). Input IO is enabled on BOTH elements and the render
-        // tries bus 0 first; the teardown log reports which bus
-        // delivered data.
-        var enableIO: UInt32 = 1
-        var disableIO: UInt32 = 0
-        FileLog.log("mic: [input unit] enabling input element (park-capable)")
-        var st = AudioUnitSetProperty(
-            unit, kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size)
-        )
-        _ = AudioUnitSetProperty(
-            unit, kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Input, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size)
-        )
-        guard st == noErr else {
-            AudioComponentInstanceDispose(unit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-        FileLog.log("mic: [input unit] disabling output element (park-capable)")
-        st = AudioUnitSetProperty(
-            unit, kAudioOutputUnitProperty_EnableIO,
-            kAudioUnitScope_Output, 0, &disableIO, UInt32(MemoryLayout<UInt32>.size)
-        )
-        guard st == noErr else {
-            AudioComponentInstanceDispose(unit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-
-        var device = deviceID
-        FileLog.log("mic: [input unit] pinning device (park-capable)")
-        st = AudioUnitSetProperty(
-            unit, kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global, 0, &device,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        FileLog.log("mic: [input unit] pin done")
-        guard st == noErr else {
-            AudioComponentInstanceDispose(unit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-
-        // CLIENT FORMAT (input scope): configures the device's input
-        // stream for this client. Without it the IO cycle runs and the
-        // callback fires, but the stream is never configured and every
-        // buffer is zeros (see startLocked step 6 note). Must be the
-        // PROBED device-native ASBD verbatim - HAL units do no conversion
-        // and reject non-native variants (-10865). Set on BOTH elements
-        // (diagnostic batch: element rebinding suspected on 26.2).
-        var cfmt = clientFormat
-        FileLog.log("mic: [input unit] setting client format (park-capable)")
-        st = AudioUnitSetProperty(
-            unit, kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input, 1, &cfmt,
-            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        )
-        FileLog.log("mic: [input unit] client format set (el 1): \(st)")
-        var cfmt0 = clientFormat
-        let st0 = AudioUnitSetProperty(
-            unit, kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input, 0, &cfmt0,
-            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        )
-        FileLog.log("mic: [input unit] client format set (el 0): \(st0)")
-        guard st == noErr || st0 == noErr else {
-            AudioComponentInstanceDispose(unit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-
-        // The input callback, refCon via passUnretained (the processor
-        // owns the context and disposes the unit before dropping it).
-        var callbackStruct = AURenderCallbackStruct(
-            inputProc: micInputCallback,
-            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
-        )
-        st = AudioUnitSetProperty(
-            unit, kAudioOutputUnitProperty_SetInputCallback,
-            kAudioUnitScope_Input, 1, &callbackStruct,
-            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
-        )
-        guard st == noErr else {
-            AudioComponentInstanceDispose(unit)
-            throw AudioDeviceError.queryFailed(st)
-        }
-        return unit
-    }
-
-    /// Build the AUSoundIsolation instance: mono float32 in BOTH scopes
-    /// (the probed rate), render callback on the input scope feeding it
-    /// from the capture context, then Initialize. Returns nil on ANY
-    /// failure (fail-open: the pipeline runs without isolation), after
-    /// disposing whatever was created.
     private func buildIsolationAU(sampleRate: Double) -> AudioComponentInstance? {
         var desc = Self.isolationDescription
         guard let component = AudioComponentFindNext(nil, &desc) else {
@@ -940,7 +827,7 @@ final class MicProcessor {
 
     // MARK: - Capture processing (RT, input unit's render thread)
 
-    /// Runs on the input unit's render thread via micInputCallback. Must
+    /// Runs on the device IO thread via the mic IOProc. Must
     /// not allocate or block. Semantics identical to the old
     /// processTap: meter on the raw input, voice-mute gate, isolation
     /// render (fail-open), voice chain, soft limiter, ring push.
