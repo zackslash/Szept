@@ -745,6 +745,21 @@ final class SystemAudioSharer {
     /// like sub-healthy reads - a device we cannot read sanely is a
     /// device we must not connect onto. The callback's runtime mono branch
     /// stays (harmless); nothing wires mono here.
+    /// Capture-format cache codec: "rate,channels,interleaved(0|1)".
+    /// The cache exists because in-process stream-format reads poison
+    /// after the first capture-unit teardown (see startCaptureUnit).
+    private func captureFormatString(rate: Double, channels: Int, interleaved: Bool) -> String {
+        "\(Int(rate)),\(channels),\(interleaved ? 1 : 0)"
+    }
+
+    private func parseCaptureFormat(_ s: String) -> (Double, Int, Bool)? {
+        let parts = s.split(separator: ",").compactMap { Int($0) }
+        guard parts.count == 3,
+              (8_000...192_000).contains(parts[0]),
+              (2...64).contains(parts[1]) else { return nil }
+        return (Double(parts[0]), parts[1], parts[2] == 1)
+    }
+
     private func probeStableInputFormat(deviceID: AudioDeviceID) throws -> (asbd: AudioStreamBasicDescription, source: String) {
         func read() -> AudioStreamBasicDescription? {
             AudioDeviceManager.inputStreamFormat(deviceID: deviceID)
@@ -786,22 +801,40 @@ final class SystemAudioSharer {
     /// ASBD rate (the SOLE rate authority: the stream the callback
     /// actually delivers).
     private func startCaptureUnit(blackHoleID: AudioDeviceID) throws -> (unit: AudioComponentInstance, context: CaptureContext, captureRate: Double) {
-        // (0) Sole rate/channel authority: the stability probe, run BEFORE
-        // any client exists on the device. Ordering is load-bearing: an
-        // input-only client with no client format set (macOS 26.2 rejects
-        // client-format sets) makes the HAL derive a DEGENERATE 1ch input
-        // stream for the pinned device after a multi-output teardown -
-        // pinned probes read that phantom and refuse forever (verified
-        // 2026-10-09: pinned probe read "48000 Hz 1 ch" cycle after cycle
-        // while the SAME property, read unpinned with no clients, reported
-        // a healthy 16 ch). Unpinned, the probe still does its real job:
-        // gate on sanity and stability, throw on failure - no fallback.
-        let probed = try probeStableInputFormat(deviceID: blackHoleID)
-        let rate = probed.asbd.mSampleRate
-        let channels = Int(probed.asbd.mChannelsPerFrame)
-        let interleaved = probed.asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-        let source = probed.source
-        FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native, no client format set")
+        // (0) Rate/channel authority. FIRST enable in a fresh process:
+        // probe the device object (sane, stable read). Every LATER enable:
+        // use the persisted cache. Ordering and caching are both
+        // load-bearing, verified 2026-10-09: (a) an input-only client with
+        // no client format set makes the HAL report a degenerate 1ch
+        // stream for the PINNED device, so the probe must run before any
+        // client exists; (b) after the first capture unit teardown, the
+        // process's OWN reads of the device stream format return that same
+        // phantom 1ch FOREVER (10+ min observed) while every other
+        // process reads a healthy 16 ch on both scopes - a per-process
+        // HAL cache our own client history poisons. A cached format makes
+        // later enables independent of the poisoned read; the callback
+        // already degrades gracefully (render status recorded, silence)
+        // if the real format ever drifted from the cache, and a -50
+        // (paramErr shape mismatch) clears the cache for a fresh probe.
+        let cacheKey = "shareCaptureFormatCache"
+        var rate: Double = 0
+        var channels = 0
+        var interleaved = true
+        var source = ""
+        if let cached = UserDefaults.standard.string(forKey: cacheKey),
+           let parsed = parseCaptureFormat(cached) {
+            (rate, channels, interleaved) = parsed
+            source = "cached"
+            FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - probe skipped (in-process reads poison after first teardown)")
+        } else {
+            let probed = try probeStableInputFormat(deviceID: blackHoleID)
+            rate = probed.asbd.mSampleRate
+            channels = Int(probed.asbd.mChannelsPerFrame)
+            interleaved = probed.asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+            source = probed.source
+            UserDefaults.standard.set(captureFormatString(rate: rate, channels: channels, interleaved: interleaved), forKey: cacheKey)
+            FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native, no client format set")
+        }
 
         // (1) Component resolution + instance creation.
         FileLog.log("share: [start capture unit] finding HALOutput component (park-capable)")
@@ -1143,6 +1176,14 @@ final class SystemAudioSharer {
         if let context {
             if context.lastRenderStatus != 0 {
                 FileLog.log("share: [\(label)] capture renders errored \(context.lastRenderStatus) during session")
+                if context.lastRenderStatus == -50 {
+                    // paramErr = the delivered stream shape mismatched the
+                    // allocated context: the cached format is stale (e.g.
+                    // the device was reconfigured in Audio MIDI Setup).
+                    // Clear it so the next enable probes fresh.
+                    UserDefaults.standard.removeObject(forKey: "shareCaptureFormatCache")
+                    FileLog.log("share: [\(label)] capture format cache cleared (shape mismatch)")
+                }
             }
             if context.overflowCount > 0 {
                 FileLog.log("share: [\(label)] capture buffer overflowed \(context.overflowCount) times during session")
