@@ -203,7 +203,7 @@ fileprivate final class CaptureContext {
 
 /// Opaque handle for a live share capture: the raw HAL IOProc and its
 /// device.
-fileprivate struct ShareCaptureHandle: Equatable {
+fileprivate struct ShareCaptureHandle {
     let ioProc: AudioDeviceIOProcID
     let device: AudioDeviceID
 }
@@ -973,7 +973,7 @@ final class SystemAudioSharer {
         // a capture handle is a value type - no dealloc
         // transfer story exists).
         stopCaptureUnit(unit: unit, context: context, label: reason)
-        if activeUnit == unit { activeUnit = nil }
+        if activeUnit?.ioProc == unit?.ioProc { activeUnit = nil }
         if activeContext === context { activeContext = nil }
 
         // 2. Stop the mic engine: it is unpinned, so its muted output unit
