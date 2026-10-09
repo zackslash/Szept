@@ -178,17 +178,17 @@ final class MicProcessor {
         // output unit's HAL client and can park indefinitely when the
         // device side is mid-churn (the round-6 deadlock class; the
         // post-share-teardown deferred restart aims straight at that
-        // churn window). Move the old reference out here and drop it on
-        // a utility queue, bracketed, so main never pays the dealloc.
-        let retiredEngine = engine
+        // churn window). passRetained PINS a reference that the utility
+        // queue releases deterministically - ARC alone cannot guarantee
+        // this: a fast closure run can die before the caller's epilogue,
+        // leaving the epilogue's release as the LAST one, putting the
+        // dealloc right back on main (verified by sample, 2026-10-09).
+        let retiredEngine = Unmanaged.passRetained(engine)
         engine = AVAudioEngine()
-        if retiredEngine !== engine {
-            DispatchQueue.global(qos: .utility).async {
-                FileLog.log("mic: [retire engine] releasing old engine off-main (park-capable)")
-                let released = retiredEngine
-                _ = released
-                FileLog.log("mic: [retire engine] released")
-            }
+        DispatchQueue.global(qos: .utility).async {
+            FileLog.log("mic: [retire engine] releasing old engine off-main (park-capable)")
+            retiredEngine.release()
+            FileLog.log("mic: [retire engine] released")
         }
         isolationUnit = nil
 
