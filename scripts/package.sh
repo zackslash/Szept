@@ -28,10 +28,10 @@ fi
 # user keychain search list (see scripts/setup-signing.md).
 KC="$HOME/Library/Keychains/szept-dev.keychain-db"
 if [ -f "$KC" ] && security find-identity -p codesigning "$KC" 2>/dev/null | grep -q "Szept Dev"; then
-    # The keychain password lives in the LOGIN keychain (auto-unlocked in
-    # the user session) as "szept-dev-keychain"; keep the repo free of
-    # secrets and SSH runs non-interactive.
-    KCPW=$(security find-generic-password -s szept-dev-keychain -w 2>/dev/null || true)
+    # The keychain password lives in ~/.szept-signing (mode 600, user
+    # only) - the login keychain refuses non-GUI writes over SSH, and the
+    # repo must stay secret-free.
+    KCPW=$(cat "$HOME/.szept-signing" 2>/dev/null || true)
     if [ -n "$KCPW" ]; then
         security unlock-keychain -p "$KCPW" "$KC" 2>/dev/null || true
         security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KCPW" "$KC" >/dev/null 2>&1 || true
