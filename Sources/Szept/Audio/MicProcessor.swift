@@ -202,6 +202,19 @@ final class MicProcessor {
     // no allocation, only writer); the meter timer snapshots the total and
     // computes per-window deltas.
     nonisolated(unsafe) private var tapCount = 0
+
+    // MARK: - Output dump diagnostic (szept://dump)
+    // RT capture of EXACTLY what drainRing delivers (post-chain,
+    // post-mix, post-limiter), written to ~/Desktop/szept-dump.wav by a
+    // utility queue. Exists because external readers are TCC-deaf: any
+    // SSH-run recorder gets silent zeros for mic-class devices
+    // (verified: recording the built-in mic with audible speech in the
+    // room returns zeros outside the GUI session), so the only
+    // trustworthy remote verifier of delivered audio is the app itself.
+    private let dumpCapacity = 48000 * 5
+    private let dumpBuffer: UnsafeMutablePointer<Float> = .allocate(capacity: 240_000)
+    nonisolated(unsafe) private var dumpArmed = false
+    nonisolated(unsafe) private var dumpFilled = 0
     // Optional system-audio mix bus, injected once at init by AppState and
     // never mutated afterwards. Consumed by drainRing (render thread) when
     // system-audio sharing is armed; nil/inactive leaves the render path
@@ -1243,8 +1256,77 @@ final class MicProcessor {
             }
         }
 
+        // Output dump: capture ch0 of the FINAL delivered samples (RT:
+        // fixed-capacity memcpy only; no allocation, no locking).
+        if dumpArmed, let data = list[0].mData?.assumingMemoryBound(to: Float.self) {
+            let room = dumpCapacity - dumpFilled
+            if room > 0 {
+                let take = min(frames, room)
+                dumpBuffer.advanced(by: dumpFilled).update(from: data, count: take)
+                dumpFilled += take
+                if dumpFilled >= dumpCapacity { dumpArmed = false }
+            } else {
+                dumpArmed = false
+            }
+        }
+
         // Release: finish reading samples before advancing the read index.
         OSMemoryBarrier()
         ringRead = (ringRead + n) % ringCapacity
+    }
+
+    /// Arm the output dump (szept://dump). The render thread captures 5s
+    /// of delivered audio; a utility queue writes the WAV afterward.
+    /// Main thread only.
+    func armOutputDump() {
+        guard isRunning else {
+            FileLog.log("mic: [dump] ignored, engine not running")
+            return
+        }
+        dumpFilled = 0
+        dumpArmed = true
+        FileLog.log("mic: [dump] armed (5s)")
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.5) { [weak self] in
+            guard let self else { return }
+            let filled = self.dumpFilled
+            self.dumpArmed = false
+            guard filled > 0 else {
+                FileLog.log("mic: [dump] nothing captured (engine stopped?)")
+                return
+            }
+            var sumSq: Double = 0
+            for i in 0..<filled { let v = Double(self.dumpBuffer[i]); sumSq += v * v }
+            let rms = (sumSq / Double(filled)).squareRoot()
+            var peak: Float = 0
+            for i in 0..<filled { let a = abs(self.dumpBuffer[i]); if a > peak { peak = a } }
+            self.writeDumpWav(frames: filled)
+            FileLog.log("mic: [dump] wrote \(filled) frames, rms \(String(format: "%.4f", rms)), peak \(String(format: "%.4f", peak))")
+        }
+    }
+
+    /// Write the dump buffer as a mono 16-bit WAV. Utility queue.
+    private func writeDumpWav(frames: Int) {
+        func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255), UInt8((v >> 16) & 255), UInt8((v >> 24) & 255)] }
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255)] }
+        let dataBytes = UInt32(frames * 2)
+        var wav = Data()
+        wav.append(Data("RIFF".utf8))
+        wav.append(le32(36 + dataBytes))
+        wav.append(Data("WAVE".utf8))
+        wav.append(Data("fmt ".utf8))
+        wav.append(le32(16)); wav.append(le16(1)); wav.append(le16(1))
+        wav.append(le32(48000)); wav.append(le32(48000 * 2))
+        wav.append(le16(2)); wav.append(le16(16))
+        wav.append(Data("data".utf8)); wav.append(le32(dataBytes))
+        for i in 0..<frames {
+            let v = Int16(max(-32767, min(32767, dumpBuffer[i] * 32767)))
+            wav.append(le16(UInt16(bitPattern: v)))
+        }
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop/szept-dump.wav")
+        do {
+            try wav.write(to: url)
+        } catch {
+            FileLog.log("mic: [dump] write failed: \(error.localizedDescription)")
+        }
     }
 }

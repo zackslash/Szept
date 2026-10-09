@@ -17,6 +17,7 @@ enum AppAction {
     case voiceMuteToggle
     case voiceMuteOn
     case voiceMuteOff
+    case outputDump
 
     /// Parse a `szept://` URL into an action. In custom-scheme URLs the verb
     /// is the host; an optional sub-verb is the first path component, e.g.
@@ -42,6 +43,8 @@ enum AppAction {
         case ("voicemute", "on"):  return .voiceMuteOn
         case ("voicemute", "off"): return .voiceMuteOff
         case ("voicemute", _):     return .voiceMuteToggle
+        // Diagnostic: dump exactly what the voice pipeline delivers.
+        case ("dump", _):          return .outputDump
         default:                   return nil
         }
     }
@@ -75,6 +78,8 @@ enum AppAction {
             appState.micProcessor.setVoiceMuted(true)
         case .voiceMuteOff:
             appState.micProcessor.setVoiceMuted(false)
+        case .outputDump:
+            appState.micProcessor.armOutputDump()
         }
     }
 
