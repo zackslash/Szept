@@ -53,7 +53,10 @@ system audio, ctrl+opt+M mute mic (mic only; sharing keeps flowing).
 Stream Deck and scripts can open szept://toggle, szept://clarity,
 szept://strength, szept://bypass, szept://systemaudio, and
 szept://voicemute instead; each takes /on and /off except toggle,
-clarity, and strength (use /down there).
+clarity, and strength (use /down there). szept://dump writes five
+seconds of exactly-what-Szept-delivers audio to ~/Desktop/szept-dump.wav -
+the diagnostic of last resort when a call app hears silence, because
+recorders run outside the GUI session capture mic-class devices as zeros.
 
 ## Known issues
 

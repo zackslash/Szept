@@ -88,7 +88,7 @@ enum AppAction {
     private func toggleEngine(on appState: AppState) {
         // Belt-and-braces gate for the hotkey/URL paths (the MenuView
         // button is already disabled): a share transition in flight stops
-        // the mic engine itself (I1), so a concurrent engine toggle would
+        // the mic pipeline itself (I1), so a concurrent engine toggle would
         // interleave with it.
         guard !appState.systemSharer.isBusy else {
             FileLog.log("engine: toggle ignored, share transition in progress")
@@ -96,13 +96,13 @@ enum AppAction {
         }
         let defaults = UserDefaults.standard
         if appState.micProcessor.isRunning {
-            // Sharer teardown BEFORE the mic stop: it stops the mic engine
+            // Sharer teardown BEFORE the mic stop: it stops the mic pipeline
             // itself (idempotent) in the safe order, before the
             // multi-output is destroyed (invariant I1). Async: invariant I5.
             Task { await appState.systemSharer.disable(restartMic: false) }
             appState.micProcessor.stop()
             // Szept off = everything off: the share mixes into the mic
-            // render path, so it cannot outlive the engine.
+            // render path, so it cannot outlive the pipeline.
             appState.invalidatePendingStarts()
             appState.lastError = nil
             defaults.set(false, forKey: "isProcessingEnabled")

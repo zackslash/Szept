@@ -1,15 +1,14 @@
 import Foundation
 import AudioToolbox
-import Accelerate
 import os.log
 
 /// Real-time state for the mic capture callback. Plain final class,
 /// mirroring the sharer's CaptureContext (see SystemAudioSharer): the
-/// render callback is a bare C function with NO ObjC entry, so the
-/// context must not be touchable as an ObjC object. RT rules: the
-/// callbacks take NO locks, do NO allocation, and touch NO ObjC runtime.
-/// The processor owns the context for the input unit's whole lifetime
-/// and disposes the unit before dropping the context, so the callbacks
+/// IOProcs are bare C functions with NO ObjC entry, so the context must
+/// not be touchable as an ObjC object. RT rules: the callbacks take NO
+/// locks, do NO allocation, and touch NO ObjC runtime.
+/// The processor owns the context for the IOProc's whole lifetime
+/// and destroys the IOProc before dropping the context, so the callbacks
 /// can never observe a dead refCon.
 fileprivate final class MicCaptureContext {
     let channels: Int
@@ -20,9 +19,12 @@ fileprivate final class MicCaptureContext {
     /// buffer (== channels); 1 in the non-interleaved walk.
     let stride: Int
     let capacityFrames: UInt32 = 4096
-    /// Total byte capacity of the input data area (frames x channels x
-    /// 4 for float32). The raw IOProc path clamps its copy against it.
-    var capacityBytes: Int { Int(capacityFrames) * channels * 4 }
+    /// Byte capacity of the FIRST buffer's data area (interleaved:
+    /// frames x channels x 4; non-interleaved: frames x 4), stored at
+    /// init. The raw IOProc clamps its copy against THIS - clamping
+    /// against a whole-list capacity would overrun buffer 0's storage on
+    /// non-interleaved layouts.
+    let buffer0Bytes: Int
     /// The input list's DATA area (first buffer's mData) - the raw
     /// IOProc copies device bytes here, leaving the list header intact
     /// for processCapture's layout-aware walk.
@@ -52,10 +54,6 @@ fileprivate final class MicCaptureContext {
     /// Last isolation AudioUnitRender status (fail-open diagnostics),
     /// logged only in stopLocked AFTER the units are stopped.
     nonisolated(unsafe) var isolationStatus: OSStatus = 0
-    /// Last input AudioUnitRender status (same diagnostics discipline).
-    nonisolated(unsafe) var renderStatus: OSStatus = 0
-    /// Count of input renders clipped to the preallocated capacity.
-    nonisolated(unsafe) var overflowCount: Int = 0
 
     init(asbd: AudioStreamBasicDescription) {
         channels = Int(asbd.mChannelsPerFrame)
@@ -71,6 +69,7 @@ fileprivate final class MicCaptureContext {
                 + (channels - 1) * MemoryLayout<AudioBuffer>.stride
         }
         let inDataSize = 4096 * channels * MemoryLayout<Float>.size
+        buffer0Bytes = interleaved ? inDataSize : frameBytes
         let inTotal = listSize + inDataSize
         inListPtr = UnsafeMutableRawPointer.allocate(
             byteCount: inTotal, alignment: MemoryLayout<AudioBufferList>.alignment
@@ -82,8 +81,9 @@ fileprivate final class MicCaptureContext {
         var dataOffset = listSize
         if interleaved {
             // One buffer, all channels interleaved - the device's native
-            // delivery shape (AudioUnitRender validates the list against
-            // the device format; a mismatch is -50 paramErr).
+            // delivery shape. The IOProc clamps its byte copy against
+            // buffer0Bytes, so an oversized device delivery can never
+            // overrun this storage.
             inBuffers.count = 1
             inBuffers[0] = AudioBuffer(
                 mNumberChannels: UInt32(channels),
@@ -129,10 +129,12 @@ fileprivate final class MicCaptureContext {
 /// thread). Replaces the input-unit approach entirely: every
 /// element/scope/format combination of an input-only HALOutput
 /// AudioUnit delivered zeros on macOS 26.2 while callbacks fired and
-/// renders returned noErr (in-app dump verified); the device-level
-/// IOProc receives the input buffer list DIRECTLY from the HAL - no
-/// unit, no elements, no client formats. Copies the device bytes into
-/// the context's preallocated data area, then hands off to
+/// renders returned noErr (in-app dump verified) - input-side HAL units
+/// reject non-native client formats outright (-10865), and even the
+/// verbatim native format still delivered zeros. The device-level
+/// IOProc instead receives the input buffer list DIRECTLY from the
+/// HAL - no unit, no elements, no client formats. Copies the device
+/// bytes into the context's preallocated data area, then hands off to
 /// processCapture.
 fileprivate let micIOProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, clientData -> OSStatus in
     guard let clientData else { return noErr }
@@ -142,15 +144,13 @@ fileprivate let micIOProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, cli
         UnsafeMutablePointer(mutating: inInputData)
     )
     guard abl.count > 0, let data = abl[0].mData else { return noErr }
-    let byteCount = min(Int(abl[0].mDataByteSize), context.capacityBytes)
+    let byteCount = min(Int(abl[0].mDataByteSize), context.buffer0Bytes)
     if byteCount > 0 {
         context.inDataPtr.copyMemory(from: data, byteCount: byteCount)
     }
     let frames = byteCount / 4 / max(1, context.stride)
     guard frames > 0 else { return noErr }
-    var ts = AudioTimeStamp()
-    ts.mFlags = .sampleTimeValid
-    processor.processCapture(frames: frames, timestamp: &ts)
+    processor.processCapture(frames: frames)
     return noErr
 }
 
@@ -279,6 +279,13 @@ final class MicProcessor {
     private var aggregateChannelOffset: UInt32 = 0
     private var aggregateChannelCount: UInt32 = 0
 
+    // Coexistence by design: the input IOProc runs on the STANDALONE mic
+    // device while the private aggregate (mic as clock master + BlackHole
+    // member) holds that same physical device as a member. A device-level
+    // IOProc taps the sub-device's IO cycle independently of aggregate
+    // membership, so aggregate creation (step 2) needs no ordering
+    // against IOProc creation (step 6).
+
     /// Destroy the aggregate we created, if any. Keeps the invariant that
     /// aggregateDeviceID is non-nil only while the pipeline is running.
     private func destroyAggregateIfNeeded() {
@@ -301,26 +308,26 @@ final class MicProcessor {
     private let logger = Logger(subsystem: "dev.zackslash.Szept", category: "MicProcessor")
 
     // The mic pipeline has NO AVAudioEngine (invariant I6 below): input
-    // capture is a dedicated HALOutput unit pinned to the mic interface,
-    // feeding the ring through the mic IOProc, and the AUSoundIsolation
-    // effect is a dedicated AudioComponentInstance pulled manually from
+    // capture is a raw HAL device IOProc on the mic interface, feeding
+    // the ring through micIOProc, and the AUSoundIsolation effect is a
+    // dedicated AudioComponentInstance pulled manually from
     // processCapture. The dedicated output unit (below) is unchanged. All
-    // IO is HAL units with explicit lifecycles, so the engine's graph
+    // IO is HAL objects with explicit lifecycles, so the engine's graph
     // assembly and its converter stack are gone entirely.
     //
-    // Invariant I1 (deadlock): the mic path no longer contributes ANY
-    // client on the default output - the input unit is pinned to the mic
-    // interface, and the output unit is pinned to its own target. The
-    // sharer's stop-before-destroy ordering is retained regardless (belt
-    // and braces; see SystemAudioSharer's I1).
+    // Invariant I1 (deadlock): the mic path contributes NO client on the
+    // default output - the input IOProc targets the mic interface, and
+    // the output unit is pinned to its own target. The sharer's
+    // stop-before-destroy ordering is retained regardless (belt and
+    // braces; see SystemAudioSharer's I1).
     //
     // Invariant I6 (structural immunity): the app contains ZERO
-    // AVAudioEngines; all IO is dedicated HAL units with explicit
-    // lifecycles. Default-output changes are therefore structurally
-    // invisible to the pipeline - the prod crash class (the engine's
-    // unpinned muted output unit re-targeting onto a wide-channel share
-    // multi-output and tripping Apple's converter validation) cannot
-    // exist here: there is no engine to re-target.
+    // AVAudioEngines; all IO is dedicated HAL IOProcs and units with
+    // explicit lifecycles. Default-output changes are therefore
+    // structurally invisible to the pipeline - the prod crash class (the
+    // engine's unpinned muted output unit re-targeting onto a
+    // wide-channel share multi-output and tripping Apple's converter
+    // validation) cannot exist here: there is no engine to re-target.
 
     /// Serializes start()/stop() against each other. The share teardown
     /// stops these units from the sharer's worker queue (invariant I1),
@@ -331,9 +338,9 @@ final class MicProcessor {
     /// never stop().
     private let lifecycleLock = NSLock()
 
-    /// The dedicated HAL input unit (HALOutput, input element enabled,
-    /// pinned to the mic interface). Built in startLocked, disposed in
-    /// stopLocked. File-accessible for the C callbacks in this file.
+    /// The raw HAL input IOProc on the mic interface. Created in
+    /// startLocked, destroyed in stopLocked. File-accessible for the C
+    /// callbacks in this file.
     nonisolated(unsafe) fileprivate var inputIOProcID: AudioDeviceIOProcID?
     nonisolated(unsafe) fileprivate var inputIOProcDevice: AudioDeviceID?
     /// The dedicated AUSoundIsolation instance, mono float32 in both
@@ -420,12 +427,13 @@ final class MicProcessor {
             }
         }
 
-        // 4. LIGHT settle-check, deliberately NOT the share path's probe:
-        // the mic interface is not a device we churn clients on (no pin
-        // against post-teardown unstack churn, no shared-member
-        // multi-output history), so the poison class behind the share
-        // probe's strictness does not apply. Two inputStreamFormat reads
-        // 50ms apart, identical and sane, within 500ms, is enough.
+        // 4. LIGHT settle-check, deliberately lighter than the share
+        // path's probe: the mic interface is not a device we create and
+        // destroy capture clients on, and no multi-output membership
+        // churn targets its input stream, so the share path's
+        // poison-cache machinery has nothing to guard against here. Two
+        // inputStreamFormat reads 50ms apart, identical and sane, within
+        // 500ms, is enough.
         var asbd: AudioStreamBasicDescription?
         var waitedMs = 0
         while waitedMs <= 500 {
@@ -452,30 +460,17 @@ final class MicProcessor {
         let inputInterleaved = probed.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         FileLog.log("start: input format \(Int(inputRate)) Hz, \(inputChannels) ch \(inputInterleaved ? "interleaved" : "non-interleaved")")
 
-        // 5. RT context for the input callback, shaped to the PROBED
-        // format. The client format below is the PROBED ASBD VERBATIM -
-        // HAL units do no conversion and accept only device-native
-        // formats (a canonicalized float/non-interleaved variant of a
-        // float/interleaved device stream is rejected -10865, verified
-        // on-device; the verbatim ASBD is accepted). All devices in play
-        // declare Float32 (verified: BuiltInMic 1ch, BH2ch 2ch, BH16
-        // 16ch, all float32 interleaved); the context parses per the
-        // probed flags.
+        // 5. RT context for the raw IOProc, shaped to the PROBED device
+        // format. No client format exists on this path at all: a
+        // device-level IOProc receives the device's own stream bytes, so
+        // there is nothing to negotiate - no converter, no validator,
+        // nothing for Apple's render-path validation to trip over. The
+        // context parses per the probed flags, and the IOProc clamps its
+        // copy, so a post-probe format shift degrades (garbled or
+        // clamped audio) rather than crashing.
         let context = MicCaptureContext(asbd: probed)
         captureContext = context
 
-        // 6. Build the input unit (input element enabled, output
-        // disabled, pinned to the mic interface, CLIENT FORMAT SET to
-        // the probed device-native ASBD, input callback registered).
-        // The client format is load-bearing: a format-less input unit's
-        // IO runs and its callback fires, but the device's input stream
-        // is never configured and every buffer delivers zeros (verified
-        // via the in-app dump: 5s of exact zeros with audible speech,
-        // callback sampled live; the AVAudioEngine era worked because
-        // the engine set this format internally). The round-10
-        // "-10865 rejects client formats" finding was wrong in general -
-        // the unit rejects NON-NATIVE formats; the verbatim probed ASBD
-        // is accepted.
         // 6. Create the raw HAL input IOProc on the device (no AudioUnit:
         // every input-unit configuration delivered zeros on macOS 26.2 -
         // see micIOProc's doc). The IOProc receives the device's input
@@ -509,8 +504,8 @@ final class MicProcessor {
         }
 
         // 8. Reset the ring BEFORE any producer/consumer starts (the
-        // input callback is the producer; it cannot run before step 9's
-        // start). Allocated once, reused forever.
+        // IOProc is the producer; it cannot run before step 9's
+        // AudioDeviceStart). Allocated once, reused forever.
         if ring == nil {
             ring = UnsafeMutablePointer<Float>.allocate(capacity: ringCapacity)
         }
@@ -574,6 +569,7 @@ final class MicProcessor {
     private func stopLocked() {
         FileLog.log("stop: tearing down (isRunning=\(isRunning))")
 
+        // 1. Stop the dedicated output unit.
         stopOutputUnit()
 
         // 2. Stop and destroy the input IOProc (bracketed; park-capable).
@@ -592,10 +588,8 @@ final class MicProcessor {
         // diagnostics (logged only now: the unit is stopped, so no
         // concurrent writer remains).
         if let iso = isolationAU {
-            if let ctx = captureContext {
-                if ctx.isolationStatus != 0 || ctx.overflowCount != 0 || ctx.renderStatus != 0 {
-                    FileLog.log("mic: [isolation] renderStatus=\(ctx.renderStatus), isolationStatus=\(ctx.isolationStatus), overflowCount=\(ctx.overflowCount)")
-                }
+            if let ctx = captureContext, ctx.isolationStatus != 0 {
+                FileLog.log("mic: [isolation] isolationStatus=\(ctx.isolationStatus)")
             }
             FileLog.log("mic: [isolation] uninitializing (park-capable)")
             AudioUnitUninitialize(iso)
@@ -606,7 +600,8 @@ final class MicProcessor {
         }
         captureContext = nil
 
-        // Output unit first, then the aggregate it pointed at.
+        // 4. Destroy the aggregate (output unit first, then the aggregate
+        // it pointed at).
         destroyAggregateIfNeeded()
 
         isRunning = false
@@ -740,19 +735,14 @@ final class MicProcessor {
         AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, value, 0)
     }
 
-    // MARK: - Dedicated input unit + isolation AU (builders)
+    // MARK: - Isolation AU builder
 
-    /// Build the HAL input unit: input element enabled, output element
-    /// disabled (aurioTouch / QA1533 pattern), pinned to the mic
-    /// interface, input callback registered. NO client format is set:
-    /// macOS 26.2's HAL unit rejects client formats on the input element
-    /// outright (kAudioUnitErr_PropertyNotWritable, -10865), and none is
-    /// needed - the unit delivers the DEVICE'S OWN stream format, the
-    /// same one the probe read and the context preallocates for. No
-    /// format negotiation: no converter, no validator, nothing for
-    /// Apple's render-path validation to trip over. Every mutation is
-    /// FileLog-bracketed (park-capable). Failure at any step disposes
-    /// what was created before throwing.
+    /// Build the AUSoundIsolation instance: mono float32 in BOTH scopes
+    /// (the probed rate), render callback on the input scope feeding it
+    /// from the capture context (see isolationInputCallback), then
+    /// Initialize. RETURNS NIL on ANY failure - it never throws - after
+    /// disposing whatever was created; the caller treats nil as
+    /// fail-open (the pipeline runs WITHOUT isolation, logged at start).
     private func buildIsolationAU(sampleRate: Double) -> AudioComponentInstance? {
         var desc = Self.isolationDescription
         guard let component = AudioComponentFindNext(nil, &desc) else {
@@ -831,7 +821,7 @@ final class MicProcessor {
     /// not allocate or block. Semantics identical to the old
     /// processTap: meter on the raw input, voice-mute gate, isolation
     /// render (fail-open), voice chain, soft limiter, ring push.
-    fileprivate nonisolated func processCapture(frames: Int, timestamp: UnsafePointer<AudioTimeStamp>) {
+    fileprivate nonisolated func processCapture(frames: Int) {
         guard let context = captureContext else { return }
         let inABL = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer<AudioBufferList>(OpaquePointer(context.inListPtr))
@@ -981,9 +971,9 @@ final class MicProcessor {
     /// one device. Every internal failure path disposes the instance before
     /// throwing.
     private func buildOutputUnit(deviceID: AudioDeviceID, sampleRate: Double, channelOffset: UInt32?, deviceChannelCount: UInt32? = nil) throws -> AudioComponentInstance {
-        // Match the device's nominal rate to the engine input rate so the
+        // Match the device's nominal rate to the capture rate so the
         // ring never needs resampling. Best effort; the stream format then
-        // uses the ENGINE/ring rate we actually feed, not the device's
+        // uses the RING rate we actually feed, not the device's
         // read-back rate (a mismatch would make the device consume the ring
         // at the wrong speed). Skipped for the aggregate: its nominal rate
         // follows the clock master, and setting it fails and only pollutes
@@ -992,7 +982,7 @@ final class MicProcessor {
             alignDeviceSampleRate(deviceID, to: sampleRate)
         }
         let actualRate = deviceSampleRate(deviceID) ?? sampleRate
-        FileLog.log("output: engine rate \(sampleRate), device rate \(actualRate)")
+        FileLog.log("output: ring rate \(sampleRate), device rate \(actualRate)")
 
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
@@ -1227,9 +1217,16 @@ final class MicProcessor {
     /// Main thread only.
     func armOutputDump() {
         guard isRunning else {
-            FileLog.log("mic: [dump] ignored, engine not running")
+            FileLog.log("mic: [dump] ignored, pipeline not running")
             return
         }
+        // Disarm FIRST with a barrier, THEN zero the fill counter: the
+        // render thread checks dumpArmed and then writes at dumpFilled.
+        // Re-arming while armed (double szept://dump) could otherwise let
+        // an in-flight render write at a just-zeroed index with a stale
+        // high watermark check.
+        dumpArmed = false
+        OSMemoryBarrier()
         dumpFilled = 0
         dumpArmed = true
         FileLog.log("mic: [dump] armed (5s)")
@@ -1238,7 +1235,7 @@ final class MicProcessor {
             let filled = self.dumpFilled
             self.dumpArmed = false
             guard filled > 0 else {
-                FileLog.log("mic: [dump] nothing captured (engine stopped?)")
+                FileLog.log("mic: [dump] nothing captured (pipeline stopped?)")
                 return
             }
             var sumSq: Double = 0
@@ -1256,13 +1253,14 @@ final class MicProcessor {
         func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255), UInt8((v >> 16) & 255), UInt8((v >> 24) & 255)] }
         func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255)] }
         let dataBytes = UInt32(frames * 2)
+        let rate = UInt32(renderSampleRate ?? 48000)
         var wav = Data()
         wav.append(contentsOf: Data("RIFF".utf8))
         wav.append(contentsOf: le32(36 + dataBytes))
         wav.append(contentsOf: Data("WAVE".utf8))
         wav.append(contentsOf: Data("fmt ".utf8))
         wav.append(contentsOf: le32(16)); wav.append(contentsOf: le16(1)); wav.append(contentsOf: le16(1))
-        wav.append(contentsOf: le32(48000)); wav.append(contentsOf: le32(96000))
+        wav.append(contentsOf: le32(rate)); wav.append(contentsOf: le32(rate * 2))
         wav.append(contentsOf: le16(2)); wav.append(contentsOf: le16(16))
         wav.append(contentsOf: Data("data".utf8)); wav.append(contentsOf: le32(dataBytes))
         for i in 0..<frames {

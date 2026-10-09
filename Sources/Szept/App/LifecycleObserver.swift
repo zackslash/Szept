@@ -109,10 +109,10 @@ final class LifecycleObserver {
         ) { [weak self] _ in
             guard let self, let appState = self.appState else { return }
             // Share teardown BEFORE the mic stop: the teardown stops the
-            // mic engine itself (invariant I1), in the safe order.
+            // mic pipeline itself (invariant I1), in the safe order.
             // Never sleep with the share multi-output as the default
             // output: the wake path would leave the meeting device wrong.
-            // restartMic=false: the engine goes down for sleep anyway.
+            // restartMic=false: the pipeline goes down for sleep anyway.
             // Accepted risk: the disable is async now (invariant I5), so
             // the teardown may straddle the actual sleep; a multi-output
             // leftover across sleep is owned by launch-time
@@ -155,12 +155,13 @@ final class LifecycleObserver {
     // engine-configuration observer - the app contains ZERO AVAudioEngines
     // (invariant I6), so .AVAudioEngineConfigurationChange can never fire,
     // and default-output changes no longer affect the mic path at all
-    // (every unit is pinned to its own target). Input-device loss is
-    // covered by the device-list rebuild below. Known gap: a mid-session
-    // input FORMAT change (the interface renegotiated under us) degrades
-    // until restart - the capture context is shaped to the start-time
-    // probe, and the callback fail-opens to silence on a shape mismatch.
-    // A kAudioUnitProperty_StreamFormat listener is parked as a follow-up.
+    // (every IOProc and unit targets its own device). Input-device loss
+    // is covered by the device-list rebuild below. Known gap: a
+    // mid-session input FORMAT change (the interface renegotiated under
+    // us) degrades until restart - the capture context is shaped to the
+    // start-time probe, so a shifted format yields garbled audio rather
+    // than silence (raw device bytes reinterpreted through the stale
+    // layout). A stream-format listener is parked as a follow-up.
 
     /// Coarse HAL signal that the device list changed (USB blip, coreaudiod
     /// restart). Routed through the debounced rebuild so a burst of events
@@ -183,7 +184,7 @@ final class LifecycleObserver {
             }
             // Let the sharer react to BlackHole/multi-output loss before
             // the mic rebuild guard: a dead share member must tear the
-            // share down even when the mic engine itself is not running.
+            // share down even when the mic pipeline itself is not running.
             appState.systemSharer.handleDeviceListChange()
             guard appState.micProcessor.isRunning else { return }
             if current != self.lastStableDeviceIDs {
