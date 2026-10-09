@@ -441,35 +441,30 @@ final class MicProcessor {
         FileLog.log("start: input format \(Int(inputRate)) Hz, \(inputChannels) ch \(inputInterleaved ? "interleaved" : "non-interleaved")")
 
         // 5. RT context for the input callback, shaped to the PROBED
-        // format. The context's interleaved flag follows the CLIENT
-        // format below (canonical Float32 non-interleaved) - the buffers
-        // the callback renders arrive in the client format's shape.
-        let clientASBD = AudioStreamBasicDescription(
-            mSampleRate: inputRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved,
-            mBytesPerPacket: 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 4,
-            mChannelsPerFrame: UInt32(inputChannels),
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-        let context = MicCaptureContext(asbd: clientASBD)
+        // format. The client format below is the PROBED ASBD VERBATIM -
+        // HAL units do no conversion and accept only device-native
+        // formats (a canonicalized float/non-interleaved variant of a
+        // float/interleaved device stream is rejected -10865, verified
+        // on-device; the verbatim ASBD is accepted). All devices in play
+        // declare Float32 (verified: BuiltInMic 1ch, BH2ch 2ch, BH16
+        // 16ch, all float32 interleaved); the context parses per the
+        // probed flags.
+        let context = MicCaptureContext(asbd: probed)
         captureContext = context
 
         // 6. Build the input unit (input element enabled, output
-        // disabled, pinned to the mic interface, CLIENT FORMAT SET,
-        // input callback registered). The client format is
-        // load-bearing: a format-less input unit's IO runs and its
-        // callback fires, but the device's input stream is never
-        // configured and every buffer delivers zeros (verified via the
-        // in-app dump: 5s of exact zeros with audible speech and the
+        // disabled, pinned to the mic interface, CLIENT FORMAT SET to
+        // the probed device-native ASBD, input callback registered).
+        // The client format is load-bearing: a format-less input unit's
+        // IO runs and its callback fires, but the device's input stream
+        // is never configured and every buffer delivers zeros (verified
+        // via the in-app dump: 5s of exact zeros with audible speech,
         // callback sampled live; the AVAudioEngine era worked because
         // the engine set this format internally). The round-10
-        // "-10865 rejects client formats" finding was BlackHole-16ch
-        // SPECIFIC - the mic accepts the set (verified on-device).
-        let newInputUnit = try buildInputUnit(deviceID: inputID, clientFormat: clientASBD)
+        // "-10865 rejects client formats" finding was wrong in general -
+        // the unit rejects NON-NATIVE formats; the verbatim probed ASBD
+        // is accepted.
+        let newInputUnit = try buildInputUnit(deviceID: inputID, clientFormat: probed)
         inputUnit = newInputUnit
 
         // 7. Build the isolation AU (mono float32 both scopes, render
@@ -806,8 +801,9 @@ final class MicProcessor {
         // CLIENT FORMAT (input scope, element 1): configures the device's
         // input stream for this client. Without it the IO cycle runs and
         // the callback fires, but the stream is never configured and every
-        // buffer is zeros (see startLocked step 6 note). BlackHole 16ch
-        // rejects this set (-10865, round 10) - mic interfaces accept it.
+        // buffer is zeros (see startLocked step 6 note). Must be the
+        // PROBED device-native ASBD verbatim - HAL units do no conversion
+        // and reject non-native variants (-10865).
         var cfmt = clientFormat
         FileLog.log("mic: [input unit] setting client format (park-capable)")
         st = AudioUnitSetProperty(

@@ -743,19 +743,22 @@ final class SystemAudioSharer {
     /// like sub-healthy reads - a device we cannot read sanely is a
     /// device we must not connect onto. The callback's runtime mono branch
     /// stays (harmless); nothing wires mono here.
-    /// Capture-format cache codec: "rate,channels,interleaved(0|1)".
+    /// Capture-format cache codec: "rate,channels,interleaved(0|1),flags".
     /// The cache exists because in-process stream-format reads poison
     /// after the first capture-unit teardown (see startCaptureUnit).
-    private func captureFormatString(rate: Double, channels: Int, interleaved: Bool) -> String {
-        "\(Int(rate)),\(channels),\(interleaved ? 1 : 0)"
+    /// The format flags ride along so the client-format set (below)
+    /// can reconstruct the device-NATIVE ASBD verbatim - HAL units
+    /// reject non-native variants.
+    private func captureFormatString(rate: Double, channels: Int, interleaved: Bool, formatFlags: UInt32) -> String {
+        "\(Int(rate)),\(channels),\(interleaved ? 1 : 0),\(formatFlags)"
     }
 
-    private func parseCaptureFormat(_ s: String) -> (Double, Int, Bool)? {
+    private func parseCaptureFormat(_ s: String) -> (Double, Int, Bool, UInt32)? {
         let parts = s.split(separator: ",").compactMap { Int($0) }
-        guard parts.count == 3,
+        guard parts.count == 4,
               (8_000...192_000).contains(parts[0]),
               (2...64).contains(parts[1]) else { return nil }
-        return (Double(parts[0]), parts[1], parts[2] == 1)
+        return (Double(parts[0]), parts[1], parts[2] == 1, UInt32(bitPattern: parts[3]))
     }
 
     private func probeStableInputFormat(deviceID: AudioDeviceID) throws -> (asbd: AudioStreamBasicDescription, source: String) {
@@ -818,10 +821,11 @@ final class SystemAudioSharer {
         var rate: Double = 0
         var channels = 0
         var interleaved = true
+        var formatFlags: UInt32 = 0
         var source = ""
         if let cached = UserDefaults.standard.string(forKey: cacheKey),
            let parsed = parseCaptureFormat(cached) {
-            (rate, channels, interleaved) = parsed
+            (rate, channels, interleaved, formatFlags) = parsed
             source = "cached"
             FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - probe skipped (in-process reads poison after first teardown)")
         } else {
@@ -829,9 +833,10 @@ final class SystemAudioSharer {
             rate = probed.asbd.mSampleRate
             channels = Int(probed.asbd.mChannelsPerFrame)
             interleaved = probed.asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+            formatFlags = probed.asbd.mFormatFlags
             source = probed.source
-            UserDefaults.standard.set(captureFormatString(rate: rate, channels: channels, interleaved: interleaved), forKey: cacheKey)
-            FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native, no client format set")
+            UserDefaults.standard.set(captureFormatString(rate: rate, channels: channels, interleaved: interleaved, formatFlags: formatFlags), forKey: cacheKey)
+            FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native")
         }
 
         // (1) Component resolution + instance creation.
@@ -905,15 +910,38 @@ final class SystemAudioSharer {
         // (see the ordering rationale there). The probed channel count
         // shaped the context below.
 
-        // (5) No ASBD to build: macOS 26.2's HAL unit rejects client
-        // formats on the input element outright (kAudioUnitErr_PropertyNotWritable,
-        // -10865, verified empirically on-device), and none is needed -
-        // the unit delivers the DEVICE'S OWN stream format by default,
-        // the same one the probe read and the context preallocates for.
-        // No format negotiation: no converter, no validator, nothing for
-        // Apple's render-path validation to trip over. (The engine-era
-        // connect did this negotiation under the hood - that converter
-        // edge was the prod crash site.)
+        // (5) CLIENT FORMAT: the device-native ASBD reconstructed from
+        // the probed/cached values, VERBATIM flags included.
+        // Load-bearing (verified via the mic path's in-app dump): a
+        // format-less input unit's IO runs and its callback fires, but
+        // the stream is never configured and every buffer is zeros.
+        // HAL units accept only device-native formats - the round-10
+        // -10865 rejection was a NON-NATIVE ASBD (non-interleaved
+        // against BH16's native interleaved), not a macOS rule. If the
+        // set is rejected here, fall back format-less and log loudly
+        // (capture will deliver zeros - a visible defect, not a silent
+        // one).
+        var cfmt = AudioStreamBasicDescription(
+            mSampleRate: rate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: formatFlags,
+            mBytesPerPacket: UInt32(4 * channels),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(4 * channels),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        FileLog.log("share: [start capture unit] setting client format (park-capable)")
+        let fmtSt = AudioUnitSetProperty(
+            halUnit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 1, &cfmt,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        FileLog.log("share: [start capture unit] client format set: \(fmtSt)")
+        if fmtSt != noErr {
+            FileLog.log("share: [start capture unit] client format REJECTED (\(fmtSt)) - capture will deliver zeros until fixed")
+        }
 
         // (6) The input callback, refCon via passUnretained (the sharer
         // owns the context and disposes the unit before dropping it).
