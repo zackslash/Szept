@@ -28,9 +28,20 @@ fi
 # user keychain search list (see scripts/setup-signing.md).
 KC="$HOME/Library/Keychains/szept-dev.keychain-db"
 if [ -f "$KC" ] && security find-identity -p codesigning "$KC" 2>/dev/null | grep -q "Szept Dev"; then
-    security unlock-keychain "$KC" 2>/dev/null || true
-    codesign --force --sign "Szept Dev" "$APP"
-    echo "Signed with Szept Dev identity"
+    # The keychain password lives in the LOGIN keychain (auto-unlocked in
+    # the user session) as "szept-dev-keychain"; keep the repo free of
+    # secrets and SSH runs non-interactive.
+    KCPW=$(security find-generic-password -s szept-dev-keychain -w 2>/dev/null || true)
+    if [ -n "$KCPW" ]; then
+        security unlock-keychain -p "$KCPW" "$KC" 2>/dev/null || true
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KCPW" "$KC" >/dev/null 2>&1 || true
+    fi
+    if codesign --force --sign "Szept Dev" "$APP" 2>/dev/null; then
+        echo "Signed with Szept Dev identity"
+    else
+        codesign --force --sign - "$APP"
+        echo "warning: Szept Dev identity present but signing failed; fell back to ad hoc"
+    fi
 else
     codesign --force --sign - "$APP"
     echo "note: Szept Dev identity not found, signed ad hoc (TCC will re-prompt per build)"
