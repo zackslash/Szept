@@ -111,11 +111,20 @@ fileprivate final class CaptureContext {
     let channels: Int
     let mixBus: SystemMixBus
 
-    /// Preallocated non-interleaved AudioBufferList: `channels` buffers x
-    /// 4096 frames x Float32, built ONCE at build time. The callback only
-    /// fills it and hands it to AudioUnitRender.
+    /// Preallocated capture list, shaped to the PROBED device format:
+    /// BlackHole delivers INTERLEAVED (verified on-device: one buffer,
+    /// all channels packed), so the default shape is a single buffer of
+    /// `channels` x 4096 frames x Float32; the non-interleaved shape
+    /// (one mono buffer per channel) is kept for devices that declare it.
+    /// Built ONCE at build time; the callback only fills it.
     let bufferListPtr: UnsafeMutableRawPointer
     let capacityFrames: UInt32 = 4096
+    let interleaved: Bool
+
+    /// Scratch deinterleave targets for the interleaved path (ch0/ch1
+    /// strided out before the mix-bus push). Preallocated: RT no-alloc.
+    let scratchL: UnsafeMutablePointer<Float>
+    let scratchR: UnsafeMutablePointer<Float>
 
     /// Written by the render callback (single word stores), read and
     /// logged only in stopCaptureUnit AFTER the unit is stopped (so no
@@ -124,35 +133,56 @@ fileprivate final class CaptureContext {
     nonisolated(unsafe) var lastRenderStatus: OSStatus = 0
     nonisolated(unsafe) var overflowCount: Int = 0
 
-    init(channels: Int, mixBus: SystemMixBus) {
+    init(channels: Int, interleaved: Bool, mixBus: SystemMixBus) {
         self.channels = channels
+        self.interleaved = interleaved
         self.mixBus = mixBus
-        let listSize = MemoryLayout<AudioBufferList>.size
-            + (channels - 1) * MemoryLayout<AudioBuffer>.stride
+        self.scratchL = .allocate(capacity: 4096)
+        self.scratchR = .allocate(capacity: 4096)
+        let listSize: Int
+        if interleaved {
+            listSize = MemoryLayout<AudioBufferList>.size
+        } else {
+            listSize = MemoryLayout<AudioBufferList>.size
+                + (channels - 1) * MemoryLayout<AudioBuffer>.stride
+        }
         let dataSize = 4096 * channels * MemoryLayout<Float>.size
         let total = listSize + dataSize
         bufferListPtr = UnsafeMutableRawPointer.allocate(
             byteCount: total, alignment: MemoryLayout<AudioBufferList>.alignment
         )
         memset(bufferListPtr, 0, total)
-        // Wire the list header: channel buffers, data area after the array.
         let buffers = UnsafeMutableAudioBufferListPointer(
             bufferListPtr.assumingMemoryBound(to: AudioBufferList.self)
         )
-        buffers.count = channels
         var dataOffset = listSize
-        for i in 0..<channels {
-            buffers[i] = AudioBuffer(
-                mNumberChannels: 1,
-                mDataByteSize: UInt32(4096 * MemoryLayout<Float>.size),
+        if interleaved {
+            // One buffer, all channels interleaved - BlackHole's native
+            // delivery shape (AudioUnitRender validates the list against
+            // the device format; a mismatch is -50 paramErr).
+            buffers.count = 1
+            buffers[0] = AudioBuffer(
+                mNumberChannels: UInt32(channels),
+                mDataByteSize: UInt32(dataSize),
                 mData: bufferListPtr + dataOffset
             )
-            dataOffset += 4096 * MemoryLayout<Float>.size
+        } else {
+            buffers.count = channels
+            for i in 0..<channels {
+                buffers[i] = AudioBuffer(
+                    mNumberChannels: 1,
+                    mDataByteSize: UInt32(4096 * MemoryLayout<Float>.size),
+                    mData: bufferListPtr + dataOffset
+                )
+                dataOffset += 4096 * MemoryLayout<Float>.size
+            }
         }
     }
 
     deinit {
         bufferListPtr.deallocate()
+        scratchL.deallocate()
+        scratchR.deallocate()
     }
 }
 
@@ -189,13 +219,31 @@ fileprivate let captureInputCallback: AURenderCallback = { refCon, _, inTimeStam
     }
     guard frameCount > 0 else { return noErr }
     let abl = UnsafeMutableAudioBufferListPointer(list)
-    guard abl.count > 0, let ch0 = abl[0].mData?.assumingMemoryBound(to: Float.self) else {
+    guard abl.count > 0, let data = abl[0].mData?.assumingMemoryBound(to: Float.self) else {
         return noErr
     }
-    if context.channels >= 2, abl.count > 1, let ch1 = abl[1].mData?.assumingMemoryBound(to: Float.self) {
-        context.mixBus.pushStereo(ch0: ch0, ch1: ch1, count: frameCount)
+    if context.interleaved {
+        // BlackHole's native shape: one buffer, channels interleaved.
+        // Stride ch0/ch1 out into the preallocated scratch pair (RT:
+        // no allocation), then push. Mono devices push ch0 directly.
+        let stride = context.channels
+        if stride >= 2 {
+            let l = context.scratchL
+            let r = context.scratchR
+            var i = 0
+            while i < frameCount {
+                l[i] = data[i * stride]
+                r[i] = data[i * stride + 1]
+                i += 1
+            }
+            context.mixBus.pushStereo(ch0: l, ch1: r, count: frameCount)
+        } else {
+            context.mixBus.push(samples: data, count: frameCount)
+        }
+    } else if context.channels >= 2, abl.count > 1, let ch1 = abl[1].mData?.assumingMemoryBound(to: Float.self) {
+        context.mixBus.pushStereo(ch0: data, ch1: ch1, count: frameCount)
     } else {
-        context.mixBus.push(samples: ch0, count: frameCount)
+        context.mixBus.push(samples: data, count: frameCount)
     }
     return noErr
 }
@@ -816,8 +864,9 @@ final class SystemAudioSharer {
         let probed = try probeStableInputFormat(deviceID: blackHoleID)
         let rate = probed.asbd.mSampleRate
         let channels = Int(probed.asbd.mChannelsPerFrame)
+        let interleaved = probed.asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         let source = probed.source
-        FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch (\(source)) - device-native, no client format set")
+        FileLog.log("share: [fmt] capture format \(Int(rate)) Hz, \(channels) ch \(interleaved ? "interleaved" : "non-interleaved") (\(source)) - device-native, no client format set")
 
         // (5) No ASBD to build: macOS 26.2's HAL unit rejects client
         // formats on the input element outright (kAudioUnitErr_PropertyNotWritable,
@@ -831,7 +880,7 @@ final class SystemAudioSharer {
 
         // (6) The input callback, refCon via passUnretained (the sharer
         // owns the context and disposes the unit before dropping it).
-        let context = CaptureContext(channels: channels, mixBus: mixBus)
+        let context = CaptureContext(channels: channels, interleaved: interleaved, mixBus: mixBus)
         context.unit = halUnit
         var callbackStruct = AURenderCallbackStruct(
             inputProc: captureInputCallback,

@@ -173,8 +173,23 @@ final class MicProcessor {
         // also restores any pre-bypass isolation/clarity).
         if isBypassed { setBypassed(false) }
 
-        // Always create a fresh engine to avoid state issues
+        // Always create a fresh engine to avoid state issues. The OLD
+        // engine must never be released on main: its dealloc closes the
+        // output unit's HAL client and can park indefinitely when the
+        // device side is mid-churn (the round-6 deadlock class; the
+        // post-share-teardown deferred restart aims straight at that
+        // churn window). Move the old reference out here and drop it on
+        // a utility queue, bracketed, so main never pays the dealloc.
+        let retiredEngine = engine
         engine = AVAudioEngine()
+        if retiredEngine !== engine {
+            DispatchQueue.global(qos: .utility).async {
+                FileLog.log("mic: [retire engine] releasing old engine off-main (park-capable)")
+                let released = retiredEngine
+                _ = released
+                FileLog.log("mic: [retire engine] released")
+            }
+        }
         isolationUnit = nil
 
         if outputDeviceID == nil {
@@ -216,8 +231,9 @@ final class MicProcessor {
         // dispatch_syncs onto the IO unit's queue, so it parks if a device
         // reconfiguration triggered by an earlier pin in the same call is
         // still in flight. Census: main-thread park-capable sites are this
-        // read, the engine = AVAudioEngine() re-assignment in start(), and
-        // stop()'s engine/AU teardown (stop() itself runs on main from
+        // read and stop()'s engine/AU teardown (the engine re-assignment
+        // in start() now releases the old engine OFF-main - see the
+        // retire block above; stop() itself runs on main from
         // toggleEngine/terminate AND from the sharer's queue, where the
         // lock serializes it against main). Pre-existing and bounded: the
         // debounce settles rebuilds >= 1s and the I1 ordering keeps the
