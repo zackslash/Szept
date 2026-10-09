@@ -139,7 +139,7 @@ fileprivate final class CaptureContext {
         let buffers = UnsafeMutableAudioBufferListPointer(
             bufferListPtr.assumingMemoryBound(to: AudioBufferList.self)
         )
-        buffers.allocateCapacity(channels)
+        buffers.count = channels
         var dataOffset = listSize
         for i in 0..<channels {
             buffers[i] = AudioBuffer(
@@ -163,7 +163,7 @@ fileprivate final class CaptureContext {
 /// AudioUnitRender error: record lastRenderStatus and return noErr -
 /// never fail the unit over one bad render.
 fileprivate let captureInputCallback: AURenderCallback = { refCon, _, inTimeStamp, _, inNumberFrames, _ -> OSStatus in
-    let context = Unmanaged<CaptureContext>.fromOpaque(refCon!).takeUnretainedValue()
+    let context = Unmanaged<CaptureContext>.fromOpaque(refCon).takeUnretainedValue()
     guard let captureUnit = context.unit else { return noErr }
     // Clamp to the preallocated capacity; count the overflow instead of
     // growing (RT: no allocation).
@@ -225,6 +225,11 @@ final class SystemAudioSharer {
     /// Last-recovery message for the user (watchdog parking, etc.). The
     /// next UI toggle surfaces it via lastError.
     private(set) var userNotice: String?
+
+    /// Clears a surfaced notice once the caller has displayed it.
+    func clearUserNotice() {
+        userNotice = nil
+    }
 
     /// True between the start and end of a teardown, so a re-entrant
     /// enable() or disable() cannot interleave with one in progress.
@@ -988,7 +993,7 @@ final class SystemAudioSharer {
         // transfer story exists).
         stopCaptureUnit(unit: unit, context: context, label: reason)
         if activeUnit == unit { activeUnit = nil }
-        if activeContext == context { activeContext = nil }
+        if activeContext === context { activeContext = nil }
 
         // 2. Stop the mic engine: it is unpinned, so its muted output unit
         // is an implicit HAL client of the multi-output (the current
